@@ -1762,6 +1762,12 @@ def normalize_spreadsheet(
                 region_df_raw = df_raw.loc[region['min_row']:region['max_row'], 
                                           region['min_col']:region['max_col']].copy()
                 
+                # Create virtual sheet name
+                if len(regions) > 1:
+                    virtual_sheet_name = f"{sheet_name}__table{region_idx:02d}"
+                else:
+                    virtual_sheet_name = sheet_name
+
                 # Process this region
                 try:
                     df_clean, clean_metadata = clean_single_sheet(region_df_raw)
@@ -1787,12 +1793,6 @@ def normalize_spreadsheet(
                         df_clean = pd.DataFrame()  # Empty DataFrame for failed sheets
                     else:
                         raise  # Re-raise if it's a different ValueError
-                
-                # Create virtual sheet name
-                if len(regions) > 1:
-                    virtual_sheet_name = f"{sheet_name}__table{region_idx:02d}"
-                else:
-                    virtual_sheet_name = sheet_name
                 
                 # Add table bounds to metadata
                 clean_metadata['table_bounds'] = region['bounds']
