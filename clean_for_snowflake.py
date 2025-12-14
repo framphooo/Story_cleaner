@@ -1039,6 +1039,7 @@ def generate_create_table_statements(
 # -----------------------------
 # MAIN PIPELINE
 # -----------------------------
+# Version: 2024-12-14 - Includes suppress_multirow_header_warning parameter
 
 def normalize_spreadsheet(
     input_path: Path,
