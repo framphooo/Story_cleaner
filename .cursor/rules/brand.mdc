@@ -1,0 +1,79 @@
+---
+alwaysApply: true
+---
+
+Cursor custom instructions for the UI
+
+Branding and legal guardrails
+	•	Do not use the brand name “Logitech” anywhere in UI text, page title, metadata, repo name, screenshots, or comments.
+	•	Do not use any brand logos or product images.
+	•	The design may be inspired by a premium hardware and tech aesthetic, but keep it generic.
+
+Typography
+	•	Font: Poppins for all UI text (headings and body).
+	•	Headings: 600 weight.
+	•	Body: 400 weight.
+	•	Use short labels and simple English.
+
+Color palette
+
+Use these exact colors:
+	•	Primary accent (Breakthrough Teal): #00FDCF
+	•	Dark green (text or deep backgrounds): #0D3A32
+	•	Light green (background tint): #D6F5F0
+	•	Cream (page background): #F3F1EC
+	•	Black: #1B1B1B
+	•	Gray: #EEEEEE
+	•	White: #FFFFFF
+
+Rules:
+	•	Background should be Cream or White, not dark.
+	•	Use teal as accent only (buttons, highlights, progress).
+	•	Avoid neon effects and heavy glow.
+
+Layout and style
+	•	Look and feel: clean, minimal, modern.
+	•	Use generous spacing and whitespace.
+	•	Rounded corners: 10–14 px.
+	•	Soft shadow only (subtle).
+	•	Use a single-column layout with a centered card for the upload flow.
+	•	Keep the UI calm: no loud animations, no 3D visuals.
+
+Components
+	•	Main card: upload area + primary action.
+	•	Secondary card: results summary + warnings.
+	•	Results table: show table name, status, rows, cols, quality flag.
+	•	Provide download buttons: cleaned Excel, combined CSV, JSON report.
+	•	Warnings and errors must be explicit and easy to scan.
+
+Copy rules
+	•	No emojis by default.
+	•	Use clear labels:
+	•	“Upload spreadsheet”
+	•	“Normalize”
+	•	“Results”
+	•	“Warnings”
+	•	“Downloads”
+	•	Explain normalization briefly in one paragraph max.
+
+Gradients
+	•	Allowed: very subtle gradient in header or accent bar:
+	•	teal to light green
+	•	Not allowed: strong gradients or multicolor gradients.
+
+⸻
+
+Implementation notes for Streamlit UI
+
+If you build the MVP in Streamlit:
+
+Theme file
+
+Create .streamlit/config.toml with:---
+Poppins font
+
+Streamlit does not natively set Google Fonts everywhere, so inject CSS in the app:
+	•	Load Poppins from Google Fonts
+	•	Apply to body, buttons, inputs, tables
+	•	Keep consistent spacing and radius
+---
