@@ -19,6 +19,9 @@ from io import BytesIO
 import hashlib
 import os
 import atexit
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Import the normalization function
 from clean_for_snowflake import normalize_spreadsheet
@@ -44,6 +47,24 @@ except (AttributeError, FileNotFoundError, KeyError):
 # Rate limiting configuration
 MAX_REQUESTS_PER_HOUR = 20  # Maximum processing requests per hour per session
 RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
+
+# Email configuration for feedback
+# Priority: Streamlit secrets > Environment variables > Default (disabled)
+try:
+    # Try Streamlit secrets first (for Streamlit Cloud)
+    FEEDBACK_EMAIL_CONFIG = st.secrets.get("feedback", {})
+    GMAIL_SENDER = FEEDBACK_EMAIL_CONFIG.get("gmail_sender", None)
+    GMAIL_APP_PASSWORD = FEEDBACK_EMAIL_CONFIG.get("gmail_app_password", None)
+    if GMAIL_SENDER is None:
+        # Fall back to environment variables
+        GMAIL_SENDER = os.getenv("GMAIL_SENDER", None)
+        GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", None)
+except (AttributeError, FileNotFoundError, KeyError):
+    # If secrets not available, use environment variables
+    GMAIL_SENDER = os.getenv("GMAIL_SENDER", None)
+    GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", None)
+
+FEEDBACK_RECIPIENT = "framphooo@gmail.com"  # Where feedback emails are sent
 
 def hash_password(password: str) -> str:
     """Hash password using SHA256."""
@@ -108,6 +129,49 @@ def cleanup_session_files():
     except Exception as e:
         # Don't show errors to user for background cleanup
         pass
+
+def send_feedback_email(feedback_text: str, job_id: str = None) -> tuple[bool, str]:
+    """
+    Send feedback email via Gmail SMTP.
+    
+    Args:
+        feedback_text: The feedback message text
+        job_id: Optional job ID from the current session
+    
+    Returns:
+        tuple: (success: bool, error_message: str)
+    """
+    # Check if email is configured
+    if not GMAIL_SENDER or not GMAIL_APP_PASSWORD:
+        return False, "Email not configured. Please set GMAIL_SENDER and GMAIL_APP_PASSWORD in environment variables or Streamlit secrets."
+    
+    try:
+        # Create message
+        msg = MIMEMultipart()
+        msg['From'] = GMAIL_SENDER
+        msg['To'] = FEEDBACK_RECIPIENT
+        msg['Subject'] = "Feedback from Normalization App"
+        
+        # Build email body
+        body = f"Feedback received from the Spreadsheet Normalizer app.\n\n"
+        body += f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        if job_id:
+            body += f"Job ID: {job_id}\n"
+        body += f"\n---\n\n{feedback_text}"
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Send email via Gmail SMTP
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        
+        return True, ""
+    
+    except Exception as e:
+        return False, f"Failed to send email: {str(e)}"
 
 def secure_delete_file(file_path: Path):
     """Securely delete a file by overwriting and removing."""
@@ -261,15 +325,18 @@ def authenticate():
         </div>
         """, unsafe_allow_html=True)
         
-        password = st.text_input("", type="password", key="auth_password", label_visibility="collapsed", placeholder="Password")
-        
-        if st.button("Access", type="primary", use_container_width=True):
-            stored_hash = hash_password(APP_PASSWORD)
-            if check_password(password, stored_hash):
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Incorrect password")
+        with st.form("login_form", clear_on_submit=False):
+            password = st.text_input("", type="password", key="auth_password", label_visibility="collapsed", placeholder="Password")
+            
+            submitted = st.form_submit_button("Access", type="primary", use_container_width=True)
+            
+            if submitted:
+                stored_hash = hash_password(APP_PASSWORD)
+                if check_password(password, stored_hash):
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("Incorrect password")
         
         st.markdown('</div></div>', unsafe_allow_html=True)
         st.stop()
@@ -301,7 +368,7 @@ if 'cleanup_registered' not in st.session_state:
 
 # Custom expander using HTML details/summary - completely bypasses Streamlit's broken expander
 def custom_expander(label, expanded=False, content_html=None):
-    """Custom expander using native HTML details/summary - no Material Icons, arrow emoji on right.
+    """Custom expander using native HTML details/summary - uses native HTML arrows.
     
     Args:
         label: The label for the expander (will get emoji prefix based on label text)
@@ -311,17 +378,19 @@ def custom_expander(label, expanded=False, content_html=None):
     import uuid
     from html import escape
     
-    # Add emoji based on label
+    # Add emoji based on label, but only if label doesn't already start with an emoji
     emoji_prefix = ""
-    if "Info" in label or "info" in label.lower():
-        emoji_prefix = "ℹ️ "
-    elif "Warning" in label or "warning" in label.lower():
-        emoji_prefix = "⚠️ "
-    elif "Error" in label or "error" in label.lower():
-        emoji_prefix = "❌ "
+    # Check if label already starts with an emoji (common emojis)
+    if not any(label.strip().startswith(emoji) for emoji in ["ℹ️", "⚠️", "❌", "✅", "🔍", "📊", "💡"]):
+        if "Info" in label or "info" in label.lower():
+            emoji_prefix = "ℹ️ "
+        elif "Warning" in label or "warning" in label.lower():
+            emoji_prefix = "⚠️ "
+        elif "Error" in label or "error" in label.lower():
+            emoji_prefix = "❌ "
     
     expander_id = f"custom_exp_{uuid.uuid4().hex[:8]}"
-    arrow_emoji = '⬆️' if expanded else '⬇️'
+    arrow_emoji = ''  # Removed emoji arrows - HTML details element already provides arrows
     
     # Inject CSS for custom expanders (only once)
     if 'custom_expander_css_injected' not in st.session_state:
@@ -333,6 +402,8 @@ def custom_expander(label, expanded=False, content_html=None):
             border-radius: 12px;
             background-color: #FFFFFF;
             overflow: hidden;
+            position: relative;
+            z-index: 1;
         }
         .custom-expander-summary {
             padding: 0.75rem 1rem;
@@ -369,6 +440,9 @@ def custom_expander(label, expanded=False, content_html=None):
             border-top: 1px solid #EEEEEE;
             background-color: #FFFFFF;
             font-family: 'Poppins', sans-serif;
+            position: relative;
+            z-index: 1;
+            margin-bottom: 0.5rem;
         }
         </style>
         """, unsafe_allow_html=True)
@@ -380,7 +454,6 @@ def custom_expander(label, expanded=False, content_html=None):
         <details {'open' if expanded else ''} class="custom-expander-details" id="{expander_id}">
             <summary class="custom-expander-summary">
                 <span>{emoji_prefix}{escape(label)}</span>
-                <span class="custom-expander-arrow">{arrow_emoji}</span>
             </summary>
             <div class="custom-expander-content">
                 {content_html}
@@ -409,7 +482,6 @@ def custom_expander(label, expanded=False, content_html=None):
             <details {'open' if self.expanded else ''} class="custom-expander-details" id="{self.expander_id}">
                 <summary class="custom-expander-summary">
                     <span>{self.emoji}{self.label}</span>
-                    <span class="custom-expander-arrow">{self.arrow}</span>
                 </summary>
                 <div class="custom-expander-content">
             """, unsafe_allow_html=True)
@@ -504,6 +576,7 @@ st.markdown("""
     }
     
     
+    /* Global button styles */
     .stButton>button {
         background-color: #00FDCF;
         color: #1B1B1B;
@@ -520,11 +593,150 @@ st.markdown("""
         box-shadow: 0 4px 8px rgba(0, 253, 207, 0.3);
     }
     
+    /* OVERRIDE: Download buttons in prominent container - SAME AS NORMALIZE BUTTON */
+    .prominent-download-buttons .stButton>button,
+    .prominent-download-buttons button {
+        background-color: #00FDCF !important;
+        background: #00FDCF !important;
+        border: none !important;
+    }
+    
     .stButton>button:disabled {
         background-color: #EEEEEE !important;
         color: #999999 !important;
         cursor: not-allowed !important;
         opacity: 0.6;
+    }
+    
+    /* Download buttons - SAME STYLE AS NORMALIZE BUTTON (primary button style) */
+    .prominent-download-buttons button:not(:disabled),
+    .prominent-download-buttons [data-testid*="stButton"] button:not(:disabled),
+    .prominent-download-buttons [data-testid*="baseButton"] button:not(:disabled),
+    .prominent-download-buttons button[kind="secondary"]:not(:disabled),
+    div.prominent-download-buttons div[data-testid*="stButton"] button:not(:disabled),
+    div.prominent-download-buttons div[data-testid*="baseButton"] button:not(:disabled) {
+        background-color: #00FDCF !important;
+        background: #00FDCF !important;
+        color: #1B1B1B !important;
+        font-weight: 600 !important;
+        border-radius: 12px !important;
+        border: none !important;
+        padding: 0.5rem 2rem !important;
+        transition: all 0.3s !important;
+        width: 100% !important;
+    }
+    
+    .prominent-download-buttons button:not(:disabled):hover,
+    .prominent-download-buttons [data-testid*="stButton"] button:not(:disabled):hover,
+    .prominent-download-buttons [data-testid*="baseButton"] button:not(:disabled):hover,
+    .prominent-download-buttons button[kind="secondary"]:not(:disabled):hover,
+    div.prominent-download-buttons div[data-testid*="stButton"] button:not(:disabled):hover,
+    div.prominent-download-buttons div[data-testid*="baseButton"] button:not(:disabled):hover {
+        background-color: #00E6BF !important;
+        background: #00E6BF !important;
+        transform: translateY(-2px) !important;
+        box-shadow: 0 4px 8px rgba(0, 253, 207, 0.3) !important;
+    }
+    
+    .prominent-download-buttons {
+        margin: 1rem 0;
+    }
+    
+    /* Question mark help icon tooltip styles (matching Streamlit's help tooltip) */
+    .help-icon-wrapper {
+        display: inline-block;
+        position: relative;
+        margin-left: 0.5rem;
+        vertical-align: middle;
+        line-height: 1;
+    }
+    
+    .help-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background-color: #808495;
+        color: #FFFFFF;
+        font-size: 11px;
+        font-weight: 600;
+        cursor: help;
+        line-height: 1;
+        font-family: 'Poppins', sans-serif;
+    }
+    
+    .help-icon:hover {
+        background-color: #5A5D72;
+    }
+    
+    .help-tooltip {
+        display: none;
+        position: absolute;
+        background-color: #D6F5F0;
+        color: #1B1B1B;
+        padding: 12px;
+        border-radius: 12px;
+        font-size: 0.875rem;
+        font-family: 'Poppins', sans-serif;
+        line-height: 1.6;
+        white-space: normal;
+        width: 300px;
+        max-width: 90vw;
+        z-index: 1000;
+        top: calc(100% + 8px);
+        left: 0;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        border: 1px solid #00FDCF;
+    }
+    
+    .help-tooltip::before {
+        content: '';
+        position: absolute;
+        bottom: 100%;
+        left: 12px;
+        border: 6px solid transparent;
+        border-bottom-color: #D6F5F0;
+    }
+    
+    .help-icon-wrapper:hover .help-tooltip {
+        display: block;
+    }
+    
+    .help-tooltip strong {
+        font-weight: 600;
+    }
+    
+    .help-tooltip > div {
+        margin: 0.75rem 0;
+    }
+    
+    .help-tooltip > div:first-child {
+        margin-top: 0;
+    }
+    
+    .help-tooltip > div:last-child {
+        margin-bottom: 0;
+    }
+    
+    /* Hide any stray closing tags or empty elements */
+    .help-tooltip div:empty,
+    .help-tooltip span:empty {
+        display: none !important;
+        height: 0 !important;
+        width: 0 !important;
+        overflow: hidden !important;
+    }
+    
+    /* Hide any text nodes that contain only closing tag patterns */
+    .help-icon-wrapper *::after {
+        content: none !important;
+    }
+    
+    /* Ensure only proper divs are visible */
+    .help-tooltip > div {
+        display: block !important;
     }
     
     .stFileUploader>div>div>div>div {
@@ -1791,6 +2003,12 @@ def recalculate_quality_flags(meta_df):
 # Helper function to aggregate and classify messages
 def aggregate_and_classify_messages(results):
     """Aggregate repeated warnings and classify messages into INFO, WARNINGS, and ERRORS."""
+    # Get suppression flags from results (with defaults if not present for backward compatibility)
+    suppress_flags = results.get('suppress_flags', {})
+    suppress_multirow = suppress_flags.get('suppress_multirow_header', False)
+    suppress_row_red = suppress_flags.get('suppress_row_reduction', False)
+    suppress_dup_col = suppress_flags.get('suppress_duplicate_column', False)
+    
     info_list = []
     warnings_list = []
     errors_list = results['errors'].copy() if results['errors'] else []
@@ -1808,8 +2026,15 @@ def aggregate_and_classify_messages(results):
             split_info.append(warning_str)
         elif 'duplicate column' in warning_str.lower():
             duplicate_col_warnings.append(warning_str)
-        elif 'multi-row header' in warning_str.lower():
+        elif 'multi-row header' in warning_str.lower() or 'header depth' in warning_str.lower():
             multirow_header_warnings.append(warning_str)
+        elif 'flagged' in warning_str.lower() and 'total row' in warning_str.lower():
+            # This is the "zero confidence" / totals flagged warning
+            if not suppress_row_red:
+                other_warnings.append(warning_str)
+        elif 'applied fill-down' in warning_str.lower() or 'fill-down' in warning_str.lower():
+            # This should be info, not warning - move to info
+            split_info.append(warning_str)  # Treat as informational
         else:
             other_warnings.append(warning_str)
     
@@ -1823,10 +2048,17 @@ def aggregate_and_classify_messages(results):
                     if w.strip():
                         if 'split into' in w.lower() or 'split sheet' in w.lower():
                             split_info.append(f"{table_name}: {w}")
+                        elif 'applied fill-down' in w.lower() or 'fill-down' in w.lower():
+                            # This is informational, not a warning
+                            split_info.append(f"{table_name}: {w}")
                         elif 'duplicate column' in w.lower():
                             duplicate_col_warnings.append((table_name, w))
                         elif 'multi-row header' in w.lower() or 'header depth' in w.lower():
                             multirow_header_warnings.append((table_name, w))
+                        elif 'flagged' in w.lower() and 'total row' in w.lower():
+                            # This is the "zero confidence" / totals flagged warning
+                            if not suppress_row_red:
+                                other_warnings.append(f"{table_name}: {w}")
                         else:
                             other_warnings.append(f"{table_name}: {w}")
             
@@ -1835,8 +2067,8 @@ def aggregate_and_classify_messages(results):
                     if e.strip():
                         errors_list.append(f"{table_name}: {e}")
     
-    # Aggregate duplicate column warnings
-    if duplicate_col_warnings:
+    # Aggregate duplicate column warnings (only if not suppressed)
+    if duplicate_col_warnings and not suppress_dup_col:
         total_dup = 0
         table_count = 0
         table_details = []
@@ -1861,8 +2093,8 @@ def aggregate_and_classify_messages(results):
                 'type': 'duplicate_columns'
             })
     
-    # Aggregate multi-row header warnings
-    if multirow_header_warnings:
+    # Aggregate multi-row header warnings (only if not suppressed)
+    if multirow_header_warnings and not suppress_multirow:
         max_depth = 1
         table_count = 0
         table_details = []
@@ -1893,14 +2125,6 @@ def aggregate_and_classify_messages(results):
             'type': 'other'
         })
     
-    # Add split info
-    if split_info:
-        info_list.append({
-            'summary': f"Sheet split into multiple tables: {len(split_info)} split(s) detected",
-            'details': split_info,
-            'type': 'split'
-        })
-    
     # Process info messages from results (successful fixes) - NEW
     info_list_from_results = []
     if 'info' in results and results['info']:
@@ -1915,6 +2139,26 @@ def aggregate_and_classify_messages(results):
                 table_name = 'N/A'
                 message = info_str
             info_list_from_results.append({'table': table_name, 'message': message})
+    
+    # Separate split info from fill-down info
+    split_info_only = [s for s in split_info if 'split into' in s.lower() or 'split sheet' in s.lower()]
+    fill_down_info = [s for s in split_info if 'fill-down' in s.lower() or 'applied fill' in s.lower()]
+    
+    # Add split info
+    if split_info_only:
+        info_list.append({
+            'summary': f"Sheets split into multiple tables: {len(split_info_only)} split(s) detected",
+            'details': split_info_only,
+            'type': 'split'
+        })
+    
+    # Add fill-down info
+    if fill_down_info:
+        info_list.append({
+            'summary': f"Context columns filled: {len(fill_down_info)} operation(s)",
+            'details': fill_down_info,
+            'type': 'fill_down'
+        })
     
     # Add info messages from results (successful fixes)
     for info_item in info_list_from_results:
@@ -1958,29 +2202,24 @@ if st.session_state.get('feedback_modal_open', False):
         with col_submit:
             if st.button("Submit", key="feedback_submit_modal"):
                 if feedback_text.strip():
-                    # Save feedback to local file
-                    feedback_dir = Path("feedback")
-                    feedback_dir.mkdir(exist_ok=True)
+                    # Get job ID if available
+                    job_id = st.session_state.get('job_id', None)
                     
-                    feedback_data = {
-                        'timestamp': datetime.now().isoformat(),
-                        'job_id': st.session_state.job_id,
-                        'feedback': feedback_text
-                    }
+                    # Send feedback via email
+                    success, error_msg = send_feedback_email(feedback_text, job_id)
                     
-                    feedback_file = feedback_dir / f"feedback_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                    with open(feedback_file, 'w') as f:
-                        json.dump(feedback_data, f, indent=2)
-                    
-                    st.session_state.feedback_modal_open = False
-                    st.markdown("""
-                    <div style="background-color: #D6F5F0; color: #0D3A32; padding: 1rem; border-radius: 12px; 
-                                border-left: 4px solid #00FDCF; margin: 1rem 0;">
-                        <strong>Thank you for your feedback!</strong>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    time.sleep(1.5)
-                    st.rerun()
+                    if success:
+                        st.session_state.feedback_modal_open = False
+                        st.markdown("""
+                        <div style="background-color: #D6F5F0; color: #0D3A32; padding: 1rem; border-radius: 12px; 
+                                    border-left: 4px solid #00FDCF; margin: 1rem 0;">
+                            <strong>Thank you for your feedback!</strong>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        time.sleep(1.5)
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to send feedback: {error_msg}")
                 else:
                     st.warning("Please enter some feedback before submitting.")
         with col_cancel:
@@ -2039,6 +2278,38 @@ if uploaded_files and len(uploaded_files) > 5:
     st.error("Please upload a maximum of 5 files.")
     uploaded_files = uploaded_files[:5]
 
+# Auto-remove previous files when new file is uploaded after normalization
+# If normalization has been run and user uploads a new file, remove the old file(s)
+if uploaded_files and st.session_state.processing_complete and st.session_state.last_processed_files is not None:
+    uploaded_files_list = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
+    last_processed = st.session_state.last_processed_files if isinstance(st.session_state.last_processed_files, list) else [st.session_state.last_processed_files]
+    last_processed_set = set(last_processed)
+    
+    # Filter to only keep new files (not in last_processed_files)
+    new_files = [f for f in uploaded_files_list if f.name not in last_processed_set]
+    
+    # Check if all current files are the same as processed files (user might want to re-run)
+    all_files_are_processed = (len(uploaded_files_list) == len(last_processed_set) and 
+                                all(f.name in last_processed_set for f in uploaded_files_list))
+    
+    if new_files:
+        # New files detected - replace uploaded_files with just the new ones
+        # This effectively removes old files, as if user clicked the cross button
+        uploaded_files = new_files if len(new_files) > 1 else new_files[0] if new_files else None
+        # Clear previous results since we're replacing with new file
+        st.session_state.processing_complete = False
+        st.session_state.results = None
+        st.session_state.batch_results = None
+        st.session_state.current_file_name = None
+    elif not all_files_are_processed:
+        # Edge case: some files removed but no new ones - clear everything
+        uploaded_files = None
+        st.session_state.processing_complete = False
+        st.session_state.results = None
+        st.session_state.batch_results = None
+        st.session_state.current_file_name = None
+    # else: all_files_are_processed is True - keep files (user might want to re-run with same files)
+
 # Detect new file uploads - compare with last processed files
 # Only clear state when files actually change, not when processing
 if uploaded_files and not st.session_state.processing:
@@ -2062,6 +2333,10 @@ elif not uploaded_files:
 
 # Output format selection
 output_format_code = None
+suppress_multirow_header = False
+suppress_row_reduction = False
+suppress_duplicate_column = False
+
 if uploaded_files and len(uploaded_files) > 0:
     st.markdown("### Choose output format")
     output_format = st.radio(
@@ -2078,6 +2353,24 @@ if uploaded_files and len(uploaded_files) > 0:
         "Both Excel and CSV": "3"
     }
     output_format_code = format_map[output_format]
+    
+    # Warning suppression options (defaulted to True to reduce noise)
+    st.markdown("### Warning options")
+    suppress_multirow_header = st.checkbox(
+        "Suppress multi-row header warnings",
+        value=True,
+        help="Hide warnings about multi-row headers detected in tables"
+    )
+    suppress_duplicate_column = st.checkbox(
+        "Suppress duplicate column warnings",
+        value=True,
+        help="Hide warnings about duplicate column names that were fixed"
+    )
+    suppress_row_reduction = st.checkbox(
+        "Suppress row reduction and total row warnings",
+        value=True,
+        help="Hide warnings about significant row reduction and flagged potential total rows"
+    )
     
     # Normalize button - always allows new run, even on same file
     if st.button("Normalize", type="primary", use_container_width=True):
@@ -2146,7 +2439,10 @@ if st.session_state.processing:
             results = normalize_spreadsheet(
                 input_path=input_path,
                 output_format=output_format_code,
-                output_dir=job_dir
+                output_dir=job_dir,
+                suppress_multirow_header_warning=suppress_multirow_header,
+                suppress_row_reduction_warning=suppress_row_reduction,
+                suppress_duplicate_column_warning=suppress_duplicate_column
             )
             
             # Create run report
@@ -2213,7 +2509,10 @@ if st.session_state.processing:
                     file_results = normalize_spreadsheet(
                         input_path=input_path,
                         output_format=output_format_code,
-                        output_dir=file_job_dir
+                        output_dir=file_job_dir,
+                        suppress_multirow_header_warning=suppress_multirow_header,
+                        suppress_row_reduction_warning=suppress_row_reduction,
+                        suppress_duplicate_column_warning=suppress_duplicate_column
                     )
                     
                     # Delete original uploaded file immediately after processing
@@ -2366,10 +2665,23 @@ if st.session_state.results is not None:
     
     st.markdown("## Results")
     
+    # Get filtered warnings to determine actual status (after suppression)
+    info_list, warnings_list, errors_list = aggregate_and_classify_messages(results)
+    
+    # Determine actual status based on filtered warnings
+    actual_status = results['status']
+    if results['status'] == 'partial' and len(warnings_list) == 0 and len(errors_list) == 0:
+        # If all warnings were suppressed, treat as success
+        actual_status = 'success'
+    elif len(errors_list) > 0:
+        actual_status = 'error'
+    elif len(warnings_list) > 0:
+        actual_status = 'partial'
+    
     # Status banner with badge containing text
-    if results['status'] == 'success':
+    if actual_status == 'success':
         st.markdown('<div class="status-success"><span class="status-badge completed"><strong>Completed:</strong> All tables normalized successfully</span></div>', unsafe_allow_html=True)
-    elif results['status'] == 'partial':
+    elif actual_status == 'partial':
         st.markdown('<div class="status-warning"><span class="status-badge warnings"><strong>Completed with warnings:</strong> Normalized with warnings</span></div>', unsafe_allow_html=True)
     else:
         st.markdown('<div class="status-error"><span class="status-badge error"><strong>Error:</strong> Failed - errors encountered</span></div>', unsafe_allow_html=True)
@@ -2420,7 +2732,56 @@ if st.session_state.results is not None:
         )
     
     # Downloads section (moved up, right after Results)
-    st.markdown("### Downloads")
+    # Add info icon next to heading with popover
+    download_info_html = """
+    <div><strong>Excel:</strong> Cleaned spreadsheet with your data plus META and TYPE_ANALYSIS sheets</div>
+    <div><strong>CSV:</strong> Combined data from all tables in a single file, ready for import</div>
+    <div><strong>SQL:</strong> CREATE TABLE statements for creating database tables (e.g., in Snowflake). This is a text file you run in a SQL editor - it's separate from your data files.</div>
+    <div><strong>Report:</strong> Detailed processing summary and metadata</div>
+    """
+    
+    st.markdown("""
+    <div style="display: flex; align-items: center; gap: 0.5rem;">
+        <h3 style="display: inline; margin: 0; font-family: 'Poppins', sans-serif; font-weight: 600; vertical-align: middle;">
+            Downloads
+        </h3>
+        <span class="help-icon-wrapper" style="display: inline-block; vertical-align: middle; position: relative;">
+            <span class="help-icon">?</span>
+            <div class="help-tooltip">
+    """ + download_info_html + """
+            </div>
+        </span>
+    </div>
+    <script>
+    (function() {
+        // Remove any text nodes that look like closing tags
+        const tooltip = document.querySelector('.help-tooltip');
+        if (tooltip) {
+            const walker = document.createTreeWalker(
+                tooltip,
+                NodeFilter.SHOW_TEXT,
+                null,
+                false
+            );
+            let node;
+            const nodesToRemove = [];
+            while (node = walker.nextNode()) {
+                const text = node.textContent.trim();
+                if (text.match(/^<\\/?(div|span|h3|p)>$/i) || text === '</div>' || text === '</span>') {
+                    nodesToRemove.push(node);
+                }
+            }
+            nodesToRemove.forEach(n => n.remove());
+        }
+    })();
+    </script>
+    """, unsafe_allow_html=True)
+    
+    # Add spacing before download buttons to reduce crowding
+    st.markdown("<div style='margin-top: 1.5rem; margin-bottom: 0.5rem;'></div>", unsafe_allow_html=True)
+    
+    # Wrap download buttons in a container for styling
+    st.markdown('<div class="prominent-download-buttons">', unsafe_allow_html=True)
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -2434,7 +2795,8 @@ if st.session_state.results is not None:
                     file_name=results['excel_output_path'].name,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     disabled=False,
-                    key="dl_excel_main"
+                    key="dl_excel_main",
+                    help="Cleaned spreadsheet with data and metadata sheets"
                 )
         else:
             st.download_button(
@@ -2442,7 +2804,8 @@ if st.session_state.results is not None:
                 data=b"",
                 file_name="",
                 disabled=True,
-                key="dl_excel_main_disabled"
+                key="dl_excel_main_disabled",
+                help="Cleaned spreadsheet with data and metadata sheets"
             )
     
     with col2:
@@ -2455,7 +2818,8 @@ if st.session_state.results is not None:
                     file_name=results['csv_output_path'].name,
                     mime="text/csv",
                     disabled=False,
-                    key="dl_csv_main"
+                    key="dl_csv_main",
+                    help="Combined data from all tables in CSV format"
                 )
         else:
             st.download_button(
@@ -2463,22 +2827,27 @@ if st.session_state.results is not None:
                 data=b"",
                 file_name="",
                 disabled=True,
-                key="dl_csv_main_disabled"
+                key="dl_csv_main_disabled",
+                help="Combined data from all tables in CSV format"
             )
     
     with col3:
         sql_exists = results.get('sql_output_path') and results['sql_output_path'].exists()
         if sql_exists:
-            with open(results['sql_output_path'], 'rb') as f:
-                st.download_button(
-                    label="Download SQL",
-                    data=f.read(),
-                    file_name=results['sql_output_path'].name,
-                    mime="text/plain",
-                    disabled=False,
-                    key="dl_sql_main",
-                    help="CREATE TABLE statements for Snowflake"
-                )
+            # Read SQL file for download button
+            with open(results['sql_output_path'], 'r', encoding='utf-8') as f:
+                sql_content = f.read()
+            
+            # Download button with UTF-8 encoded bytes
+            st.download_button(
+                label="Download SQL",
+                data=sql_content.encode('utf-8'),
+                file_name=results['sql_output_path'].name,
+                mime="text/x-sql",
+                disabled=False,
+                key="dl_sql_main",
+                help="Download CREATE TABLE SQL statements as a .sql file"
+            )
         else:
             st.download_button(
                 label="Download SQL",
@@ -2486,7 +2855,7 @@ if st.session_state.results is not None:
                 file_name="",
                 disabled=True,
                 key="dl_sql_main_disabled",
-                help="CREATE TABLE statements for Snowflake"
+                help="SQL CREATE TABLE statements will be generated after normalization"
             )
     
     with col4:
@@ -2510,8 +2879,71 @@ if st.session_state.results is not None:
                 key="dl_report_main_disabled"
             )
     
-    # Warnings, Errors, Info sections
-    info_list, warnings_list, errors_list = aggregate_and_classify_messages(results)
+    # Close prominent download buttons container
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Add JavaScript to FORCE download buttons to match Normalize button style (teal background)
+    st.markdown("""
+    <script>
+    function applyDownloadButtonStyles() {
+        const prominentContainer = document.querySelector('.prominent-download-buttons');
+        if (prominentContainer) {
+            const buttons = prominentContainer.querySelectorAll('button');
+            buttons.forEach(btn => {
+                if (!btn.disabled && btn.textContent.includes('Download')) {
+                    // Apply SAME styles as Normalize button (primary button style)
+                    btn.style.setProperty('background-color', '#00FDCF', 'important');
+                    btn.style.setProperty('background', '#00FDCF', 'important');
+                    btn.style.setProperty('color', '#1B1B1B', 'important');
+                    btn.style.setProperty('font-weight', '600', 'important');
+                    btn.style.setProperty('border-radius', '12px', 'important');
+                    btn.style.setProperty('border', 'none', 'important');
+                    btn.style.setProperty('padding', '0.5rem 2rem', 'important');
+                    btn.style.setProperty('transition', 'all 0.3s', 'important');
+                    btn.style.setProperty('width', '100%', 'important');
+                    
+                    // Remove old listeners if any (by cloning)
+                    const hasListener = btn.hasAttribute('data-download-styled');
+                    if (!hasListener) {
+                        btn.setAttribute('data-download-styled', 'true');
+                        
+                        btn.addEventListener('mouseenter', function() {
+                            if (!this.disabled) {
+                                this.style.setProperty('background-color', '#00E6BF', 'important');
+                                this.style.setProperty('background', '#00E6BF', 'important');
+                                this.style.setProperty('transform', 'translateY(-2px)', 'important');
+                                this.style.setProperty('box-shadow', '0 4px 8px rgba(0, 253, 207, 0.3)', 'important');
+                            }
+                        });
+                        btn.addEventListener('mouseleave', function() {
+                            if (!this.disabled) {
+                                this.style.setProperty('background-color', '#00FDCF', 'important');
+                                this.style.setProperty('background', '#00FDCF', 'important');
+                                this.style.setProperty('transform', 'translateY(0)', 'important');
+                                this.style.setProperty('box-shadow', 'none', 'important');
+                            }
+                        });
+                    }
+                }
+            });
+        }
+    }
+    
+    // Run multiple times to catch dynamic content
+    applyDownloadButtonStyles();
+    setTimeout(applyDownloadButtonStyles, 100);
+    setTimeout(applyDownloadButtonStyles, 500);
+    setTimeout(applyDownloadButtonStyles, 1000);
+    
+    // Watch for DOM changes
+    const observer = new MutationObserver(function(mutations) {
+        applyDownloadButtonStyles();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    </script>
+    """, unsafe_allow_html=True)
+    
+    # Warnings, Errors, Info sections (already calculated above for status)
     
     # Render Info section (NEW - shows successful fixes)
     if info_list:
@@ -2520,7 +2952,7 @@ if st.session_state.results is not None:
             if isinstance(item, dict):
                 summary = item.get('summary', '')
                 details = item.get('details', [])
-                info_content.append(f"<div style='margin: 0.5rem 0;'>ℹ️ <strong>{summary}</strong></div>")
+                info_content.append(f"<div style='margin: 0.5rem 0;'><strong>{summary}</strong></div>")
                 if details and len(details) > 0:
                     detail_items = []
                     for detail in details[:10]:  # Limit to first 10
@@ -2531,16 +2963,16 @@ if st.session_state.results is not None:
                     details_html = "".join(detail_items)
                     info_content.append(f"<div style='margin-left: 1rem; margin-top: 0.5rem; margin-bottom: 0.5rem;'>{details_html}</div>")
             else:
-                info_content.append(f"<div style='margin: 0.5rem 0;'>ℹ️ {item}</div>")
-        # Use custom expander for Info section
-        custom_expander("✅ Info", expanded=False, content_html="".join(info_content))
+                info_content.append(f"<div style='margin: 0.5rem 0;'>{item}</div>")
+        # Use custom expander for Info section - expanded by default so it's visible - only one emoji in label
+        custom_expander("ℹ️ Info", expanded=True, content_html="".join(info_content))
     
     # Render Warnings section
     if warnings_list:
         warnings_content = []
         for item in warnings_list:
             if isinstance(item, dict):
-                warnings_content.append(f"<div style='margin: 0.5rem 0;'>⚠️ <strong>{item['summary']}</strong></div>")
+                warnings_content.append(f"<div style='margin: 0.5rem 0;'><strong>{item['summary']}</strong></div>")
                 if item.get('details') and len(item['details']) > 0:
                     detail_items = []
                     for detail in item['details'][:10]:  # Limit to first 10
@@ -2551,16 +2983,16 @@ if st.session_state.results is not None:
                     details_html = "".join(detail_items)
                     warnings_content.append(f"<div style='margin-left: 1rem; margin-top: 0.5rem; margin-bottom: 0.5rem;'>{details_html}</div>")
             else:
-                warnings_content.append(f"<div style='margin: 0.5rem 0;'>⚠️ {item}</div>")
+                warnings_content.append(f"<div style='margin: 0.5rem 0;'>{item}</div>")
         custom_expander("⚠️ Warnings", expanded=False, content_html="".join(warnings_content))
     
     # Render Errors section
     if errors_list:
         errors_content = []
         for error in errors_list[:10]:
-            errors_content.append(f"<div style='margin: 0.5rem 0;'>❌ {error}</div>")
+            errors_content.append(f"<div style='margin: 0.5rem 0;'>{error}</div>")
         if len(errors_list) > 10:
-            more_errors_html = "".join([f"<div style='margin: 0.5rem 0;'>❌ {error}</div>" for error in errors_list[10:]])
+            more_errors_html = "".join([f"<div style='margin: 0.5rem 0;'>{error}</div>" for error in errors_list[10:]])
             errors_content.append(f"<div style='margin-top: 1rem;'><strong>Additional errors:</strong></div>{more_errors_html}")
         custom_expander("❌ Errors", expanded=False, content_html="".join(errors_content))
 
