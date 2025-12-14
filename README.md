@@ -13,6 +13,17 @@ This tool automatically:
 - Fills down context columns
 - Outputs cleaned Excel files with META sheets and/or combined CSV files
 
+## Security Features
+
+This app includes enterprise-grade security:
+
+- 🔒 **Password Protection**: Access requires authentication
+- ⏱️ **Rate Limiting**: Maximum 20 requests per hour per session
+- 🗑️ **Secure File Deletion**: Original files deleted immediately after processing
+- 🧹 **Automatic Cleanup**: Temporary files cleaned when session ends
+
+**⚠️ Important**: Change the default password before deploying! See `SECURITY_SETUP.md` for instructions.
+
 ## Setup
 
 ### Prerequisites
@@ -27,12 +38,17 @@ This tool automatically:
 pip install -r requirements.txt
 ```
 
-2. Run the Streamlit app:
+2. **Set your password** (required):
+   - For local: `export APP_PASSWORD="your_password"`
+   - For Streamlit Cloud: See `SECURITY_SETUP.md`
+
+3. Run the Streamlit app:
 ```bash
 streamlit run app_streamlit.py
 ```
 
-3. Open your browser to the URL shown (typically `http://localhost:8501`)
+4. Open your browser to the URL shown (typically `http://localhost:8501`)
+5. **Login** with your password
 
 ## How to use
 

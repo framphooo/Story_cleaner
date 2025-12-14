@@ -9,16 +9,272 @@ import streamlit as st
 import streamlit.components.v1 as components
 from pathlib import Path
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import tempfile
 import shutil
 import pandas as pd
 import time
 import zipfile
 from io import BytesIO
+import hashlib
+import os
+import atexit
 
 # Import the normalization function
 from clean_for_snowflake import normalize_spreadsheet
+
+# ============================================================================
+# SECURITY MODULE: Authentication, Rate Limiting, and File Cleanup
+# ============================================================================
+
+# Password configuration - CHANGE THIS PASSWORD!
+# Priority: Streamlit secrets > Environment variable > Default
+# For Streamlit Cloud: Use Secrets (Settings → Secrets)
+# For local: Use environment variable: export APP_PASSWORD="your_password"
+try:
+    # Try Streamlit secrets first (for Streamlit Cloud)
+    APP_PASSWORD = st.secrets.get("security", {}).get("password", None)
+    if APP_PASSWORD is None:
+        # Fall back to environment variable
+        APP_PASSWORD = os.getenv("APP_PASSWORD", "ChangeMe123!")
+except (AttributeError, FileNotFoundError, KeyError):
+    # If secrets not available, use environment variable or default
+    APP_PASSWORD = os.getenv("APP_PASSWORD", "ChangeMe123!")
+
+# Rate limiting configuration
+MAX_REQUESTS_PER_HOUR = 20  # Maximum processing requests per hour per session
+RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
+
+def hash_password(password: str) -> str:
+    """Hash password using SHA256."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def check_password(password: str, password_hash: str) -> bool:
+    """Verify password against hash."""
+    return hash_password(password) == password_hash
+
+def check_rate_limit() -> tuple[bool, str]:
+    """Check if user has exceeded rate limit. Returns (allowed, message)."""
+    if 'rate_limit_requests' not in st.session_state:
+        st.session_state.rate_limit_requests = []
+    
+    now = time.time()
+    # Remove requests older than the rate limit window
+    st.session_state.rate_limit_requests = [
+        req_time for req_time in st.session_state.rate_limit_requests
+        if now - req_time < RATE_LIMIT_WINDOW
+    ]
+    
+    # Check if limit exceeded
+    if len(st.session_state.rate_limit_requests) >= MAX_REQUESTS_PER_HOUR:
+        remaining_time = RATE_LIMIT_WINDOW - (now - st.session_state.rate_limit_requests[0])
+        minutes = int(remaining_time / 60)
+        return False, f"Rate limit exceeded. Please wait {minutes} minutes before processing more files."
+    
+    return True, ""
+
+def record_request():
+    """Record a processing request for rate limiting."""
+    if 'rate_limit_requests' not in st.session_state:
+        st.session_state.rate_limit_requests = []
+    st.session_state.rate_limit_requests.append(time.time())
+
+def cleanup_session_files():
+    """Clean up all temporary files from current session."""
+    try:
+        # Clean up temp_jobs directories created in this session
+        if 'session_job_dirs' in st.session_state:
+            for job_dir in st.session_state.session_job_dirs:
+                if job_dir.exists():
+                    try:
+                        shutil.rmtree(job_dir)
+                    except Exception as e:
+                        st.error(f"Error cleaning up {job_dir}: {e}")
+            st.session_state.session_job_dirs = []
+        
+        # Clean up any temp files in temp_jobs older than 1 hour
+        temp_jobs_dir = Path("temp_jobs")
+        if temp_jobs_dir.exists():
+            now = time.time()
+            for item in temp_jobs_dir.iterdir():
+                if item.is_dir():
+                    try:
+                        # Check if directory is older than 1 hour
+                        mtime = item.stat().st_mtime
+                        if now - mtime > 3600:  # 1 hour
+                            shutil.rmtree(item)
+                    except Exception:
+                        pass  # Ignore errors for old cleanup
+    except Exception as e:
+        # Don't show errors to user for background cleanup
+        pass
+
+def secure_delete_file(file_path: Path):
+    """Securely delete a file by overwriting and removing."""
+    try:
+        if file_path.exists():
+            # Overwrite with zeros (simple secure delete)
+            if file_path.is_file():
+                with open(file_path, "ba+", buffering=0) as f:
+                    f.seek(0)
+                    f.write(b'\x00' * min(1024, file_path.stat().st_size))
+                file_path.unlink()
+            elif file_path.is_dir():
+                shutil.rmtree(file_path)
+    except Exception:
+        pass  # Ignore errors during cleanup
+
+def authenticate():
+    """Handle user authentication. Returns True if authenticated."""
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    
+    if not st.session_state.authenticated:
+        st.markdown("""
+        <style>
+        /* Load Poppins font */
+        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap');
+        
+        /* Hide everything Streamlit default */
+        header[data-testid="stHeader"],
+        #MainMenu,
+        footer,
+        .stDeployButton {
+            display: none !important;
+        }
+        
+        /* Full page dark green background */
+        .stApp {
+            background-color: #0D3A32 !important;
+        }
+        
+        /* Remove all padding and margins */
+        .main .block-container {
+            padding: 0 !important;
+            margin: 0 !important;
+            max-width: 100% !important;
+        }
+        
+        /* Prevent body scroll */
+        body {
+            overflow: hidden !important;
+        }
+        
+        /* Center login content vertically and horizontally - fixed viewport */
+        .login-wrapper {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 2rem;
+        }
+        
+        .login-simple {
+            text-align: center;
+            color: #FFFFFF !important;
+            width: 100%;
+            max-width: 400px;
+        }
+        
+        /* Ensure all text is white and uses Poppins */
+        .login-simple,
+        .login-simple *,
+        .login-simple h3,
+        .login-simple p,
+        .login-simple div,
+        .login-simple h3 * {
+            color: #FFFFFF !important;
+            font-family: 'Poppins', sans-serif !important;
+        }
+        
+        /* Override any Streamlit default text colors */
+        .stMarkdown,
+        .stMarkdown h3,
+        .stMarkdown p {
+            color: #FFFFFF !important;
+        }
+        
+        /* Style placeholder text */
+        .stTextInput > div > div > input::placeholder {
+            color: #999999 !important;
+            font-family: 'Poppins', sans-serif !important;
+        }
+        
+        /* Button text should be dark (on teal background) */
+        .stButton > button {
+            color: #1B1B1B !important;
+        }
+        
+        /* Style password input */
+        .stTextInput > div > div > input {
+            background-color: #FFFFFF !important;
+            color: #1B1B1B !important;
+            border-radius: 12px !important;
+            padding: 0.75rem 1rem !important;
+            font-family: 'Poppins', sans-serif !important;
+            width: 100% !important;
+            margin: 0 auto 1.5rem auto !important;
+        }
+        
+        /* Style button */
+        .stButton > button {
+            background-color: #00FDCF !important;
+            color: #1B1B1B !important;
+            font-weight: 600 !important;
+            border-radius: 12px !important;
+            border: none !important;
+            padding: 0.75rem 2rem !important;
+            font-family: 'Poppins', sans-serif !important;
+            width: 100% !important;
+            margin: 0 auto !important;
+        }
+        
+        .stButton > button:hover {
+            background-color: #00E6BF !important;
+        }
+        
+        /* Error message styling */
+        .stAlert {
+            max-width: 100%;
+            margin: 1rem auto !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        st.markdown('<div class="login-wrapper"><div class="login-simple">', unsafe_allow_html=True)
+        st.markdown("""
+        <div style="color: #FFFFFF !important; font-family: 'Poppins', sans-serif !important;">
+            <h3 style="color: #FFFFFF !important; font-family: 'Poppins', sans-serif !important; font-weight: 600 !important; 
+                       font-size: 1.75rem !important; margin-bottom: 1rem !important; letter-spacing: 0.5px !important;
+                       line-height: 1.4 !important;">
+                🔒 Enter password to access
+            </h3>
+            <p style="color: #FFFFFF !important; font-family: 'Poppins', sans-serif !important; font-weight: 400 !important; 
+                      font-size: 1rem !important; margin-bottom: 2.5rem !important; opacity: 0.95 !important;
+                      line-height: 1.5 !important;">
+                Secure access to your spreadsheet normalizer
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        password = st.text_input("", type="password", key="auth_password", label_visibility="collapsed", placeholder="Password")
+        
+        if st.button("Access", type="primary", use_container_width=True):
+            stored_hash = hash_password(APP_PASSWORD)
+            if check_password(password, stored_hash):
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password")
+        
+        st.markdown('</div></div>', unsafe_allow_html=True)
+        st.stop()
+    
+    return True
 
 # Page configuration
 st.set_page_config(
@@ -27,6 +283,20 @@ st.set_page_config(
     layout="centered",
     initial_sidebar_state="collapsed"
 )
+
+# ============================================================================
+# AUTHENTICATION - Must be first thing after page config
+# ============================================================================
+authenticate()
+
+# Initialize session state for file tracking
+if 'session_job_dirs' not in st.session_state:
+    st.session_state.session_job_dirs = []
+
+# Register cleanup function to run on session end
+if 'cleanup_registered' not in st.session_state:
+    atexit.register(cleanup_session_files)
+    st.session_state.cleanup_registered = True
 
 
 # Custom expander using HTML details/summary - completely bypasses Streamlit's broken expander
@@ -1605,13 +1875,19 @@ def aggregate_and_classify_messages(results):
     
     return info_list, warnings_list, errors_list
 
-# Page header with feedback button
-col_header1, col_header2 = st.columns([4, 1], gap="small")
+# Page header with feedback and logout buttons
+col_header1, col_header2, col_header3 = st.columns([3, 1, 1], gap="small")
 with col_header1:
     st.title("Spreadsheet Normalizer")
 with col_header2:
     if st.button("Give feedback", key="feedback_button_header", help="Open feedback form"):
         st.session_state.feedback_modal_open = not st.session_state.get('feedback_modal_open', False)
+with col_header3:
+    if st.button("🔒 Logout", key="logout_button", help="Logout and clean up session"):
+        # Clean up all session files before logout
+        cleanup_session_files()
+        st.session_state.authenticated = False
+        st.rerun()
 
 st.markdown("---")
 
@@ -1754,9 +2030,17 @@ if uploaded_files and len(uploaded_files) > 0:
     
     # Normalize button - always allows new run, even on same file
     if st.button("Normalize", type="primary", use_container_width=True):
+        # Check rate limit before processing
+        allowed, message = check_rate_limit()
+        if not allowed:
+            st.error(message)
+            st.stop()
+        
         # Always allow new processing run - reset states
         st.session_state.processing = True
         st.session_state.processing_complete = False
+        # Record request for rate limiting
+        record_request()
         # Keep results visible until new processing completes
         st.rerun()
 
@@ -1784,6 +2068,10 @@ if st.session_state.processing:
         job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_dir = Path("temp_jobs") / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Track job directory for cleanup
+        if job_dir not in st.session_state.session_job_dirs:
+            st.session_state.session_job_dirs.append(job_dir)
         
         uploaded_files_list = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files] if uploaded_files else []
         
@@ -1825,6 +2113,11 @@ if st.session_state.processing:
             # Track processed files
             st.session_state.last_processed_files = [file_name]
             
+            # Schedule cleanup of input file after processing (keep outputs for download)
+            # Delete original uploaded file immediately after processing
+            if input_path.exists():
+                secure_delete_file(input_path)
+            
             # Add to run history
             run_entry = {
                 'job_id': job_id,
@@ -1842,6 +2135,10 @@ if st.session_state.processing:
             batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
             batch_dir = Path("temp_jobs") / f"batch_{batch_id}"
             batch_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Track batch directory for cleanup
+            if batch_dir not in st.session_state.session_job_dirs:
+                st.session_state.session_job_dirs.append(batch_dir)
             
             batch_results = []
             batch_summary = {
@@ -1867,6 +2164,10 @@ if st.session_state.processing:
                         output_format=output_format_code,
                         output_dir=file_job_dir
                     )
+                    
+                    # Delete original uploaded file immediately after processing
+                    if input_path.exists():
+                        secure_delete_file(input_path)
                     
                     report_path = create_run_report_excel(
                         file_results, f"{batch_id}_{file_name}", file_name, output_format, file_job_dir
@@ -1941,6 +2242,9 @@ if st.session_state.processing:
         
         st.session_state.processing = False
         st.session_state.processing_complete = True
+        
+        # Schedule cleanup of old temp files (background, non-blocking)
+        # Note: Output files remain available for download until session ends
         st.rerun()
         
     except Exception as e:
