@@ -2273,10 +2273,12 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-# Limit to 5 files
-if uploaded_files and len(uploaded_files) > 5:
-    st.error("Please upload a maximum of 5 files.")
-    uploaded_files = uploaded_files[:5]
+# Limit to 5 files - normalize to list first
+if uploaded_files:
+    uploaded_files = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
+    if len(uploaded_files) > 5:
+        st.error("Please upload a maximum of 5 files.")
+        uploaded_files = uploaded_files[:5]
 
 # Auto-remove previous files when new file is uploaded after normalization
 # If normalization has been run and user uploads a new file, remove the old file(s)
@@ -2295,7 +2297,8 @@ if uploaded_files and st.session_state.processing_complete and st.session_state.
     if new_files:
         # New files detected - replace uploaded_files with just the new ones
         # This effectively removes old files, as if user clicked the cross button
-        uploaded_files = new_files if len(new_files) > 1 else new_files[0] if new_files else None
+        # Always keep as a list to avoid type errors
+        uploaded_files = new_files if new_files else None
         # Clear previous results since we're replacing with new file
         st.session_state.processing_complete = False
         st.session_state.results = None
@@ -2337,7 +2340,13 @@ suppress_multirow_header = False
 suppress_row_reduction = False
 suppress_duplicate_column = False
 
-if uploaded_files and len(uploaded_files) > 0:
+# Normalize uploaded_files to always be a list (or None)
+if uploaded_files:
+    uploaded_files_list = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
+else:
+    uploaded_files_list = []
+
+if uploaded_files_list:
     st.markdown("### Choose output format")
     output_format = st.radio(
         "Choose output format:",
@@ -2417,8 +2426,7 @@ if st.session_state.processing:
         if job_dir not in st.session_state.session_job_dirs:
             st.session_state.session_job_dirs.append(job_dir)
         
-        uploaded_files_list = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files] if uploaded_files else []
-        
+        # uploaded_files_list is already normalized above, but ensure it's still valid
         if not uploaded_files_list:
             st.error("Please upload at least one file.")
             st.session_state.processing = False
