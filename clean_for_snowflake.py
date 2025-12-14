@@ -5,6 +5,9 @@ from typing import Tuple, Dict, List, Optional, Any
 from datetime import datetime
 import uuid
 import shutil
+import csv
+import re
+import math
 
 
 # -----------------------------
@@ -102,6 +105,27 @@ def expand_merged_cells(input_path: Path, output_path: Path):
 
 
 # -----------------------------
+# SQL RESERVED WORDS (Snowflake)
+# -----------------------------
+
+# Snowflake SQL reserved words that cannot be used as unquoted identifiers
+SQL_RESERVED_WORDS = {
+    'all', 'alter', 'and', 'any', 'as', 'asc', 'between', 'by', 'case', 'cast',
+    'check', 'column', 'connect', 'constraint', 'create', 'cross', 'current',
+    'current_date', 'current_time', 'current_timestamp', 'database', 'delete',
+    'desc', 'distinct', 'drop', 'else', 'end', 'exists', 'false', 'following',
+    'for', 'from', 'full', 'grant', 'group', 'having', 'in', 'increment',
+    'inner', 'insert', 'intersect', 'into', 'is', 'join', 'lateral', 'left',
+    'like', 'localtime', 'localtimestamp', 'minus', 'natural', 'not', 'null',
+    'of', 'on', 'or', 'order', 'organization', 'outer', 'over', 'partition',
+    'preceding', 'primary', 'range', 'references', 'revoke', 'right', 'rlike',
+    'row', 'rows', 'sample', 'select', 'set', 'some', 'start', 'table', 'tablesample',
+    'then', 'to', 'trigger', 'true', 'union', 'unique', 'update', 'using',
+    'values', 'view', 'when', 'whenever', 'where', 'with'
+}
+
+
+# -----------------------------
 # HEADER DETECTION + CLEANING
 # -----------------------------
 
@@ -162,9 +186,14 @@ def detect_header_depth(df: pd.DataFrame) -> Tuple[int, int]:
             # Check if it's mostly non-numeric (typical of headers)
             numeric_count = 0
             for val in row:
-                if pd.notna(val):
+                # Skip if val is a Series (shouldn't happen, but defensive)
+                if isinstance(val, pd.Series):
+                    continue
+                # Use safe helper functions to avoid Series boolean ambiguity
+                if safe_notna(val):
                     try:
-                        float(str(val).replace(',', '').replace('$', '').replace('%', ''))
+                        val_str = safe_str_strip(val)
+                        float(val_str.replace(',', '').replace('$', '').replace('%', ''))
                         numeric_count += 1
                     except (ValueError, AttributeError):
                         pass
@@ -216,8 +245,12 @@ def flatten_multirow_headers(df: pd.DataFrame, start_idx: int, depth: int) -> pd
         parts = []
         for row in header_rows:
             val = row.iloc[col_idx] if col_idx < len(row) else None
-            if pd.notna(val) and str(val).strip():
-                parts.append(str(val).strip())
+            # Use safe helper functions to avoid Series boolean ambiguity
+            if val is not None and not isinstance(val, pd.Series):
+                if safe_notna(val):
+                    val_str = safe_str_strip(val)
+                    if val_str:
+                        parts.append(val_str)
         
         if parts:
             # Join parts with underscore, but avoid duplicate consecutive parts
@@ -345,7 +378,11 @@ def detect_table_regions(df: pd.DataFrame) -> List[Dict]:
 def normalise_headers(headers) -> Tuple[list, int]:
     """
     Standardise column names: lowercase, underscores, no special characters.
-    Ensures all headers are non-empty and unique.
+    Ensures all headers are SQL-compatible:
+    - Cannot start with numbers (prefixes with 'col_')
+    - Escapes SQL reserved words (adds '_col' suffix)
+    - Validates length (truncates to 255 chars for Snowflake)
+    - Ensures all headers are non-empty and unique.
     
     Returns:
         tuple: (normalized_headers_list, duplicate_count)
@@ -370,15 +407,35 @@ def normalise_headers(headers) -> Tuple[list, int]:
         else:
             clean_list.append(val)
     
-    # Step 3: Ensure uniqueness by adding suffixes (_2, _3, etc.)
+    # Step 3: Fix SQL-incompatible column names
+    sql_safe_list = []
+    for header in clean_list:
+        # Check if starts with number (SQL doesn't allow this)
+        if header and header[0].isdigit():
+            header = f"col_{header}"
+        
+        # Check if it's a SQL reserved word
+        if header in SQL_RESERVED_WORDS:
+            header = f"{header}_col"
+        
+        # Validate length (Snowflake max identifier length is 255)
+        if len(header) > 255:
+            header = header[:252] + "..."
+        
+        sql_safe_list.append(header)
+    
+    # Step 4: Ensure uniqueness by adding suffixes (_2, _3, etc.)
     seen = {}
     final_headers = []
     duplicate_count = 0
     
-    for header in clean_list:
+    for header in sql_safe_list:
         if header in seen:
             seen[header] += 1
             new_header = f"{header}_{seen[header]}"
+            # Re-check length after adding suffix
+            if len(new_header) > 255:
+                new_header = new_header[:252] + "..."
             final_headers.append(new_header)
             duplicate_count += 1
         else:
@@ -412,9 +469,24 @@ def detect_repeated_headers(df_data: pd.DataFrame, normalized_headers: List[str]
     rows_to_drop = []
     
     for idx in df_data.index:
-        row_values = df_data.loc[idx].astype(str)
+        # Get row - handle case where duplicate columns might return DataFrame
+        row_data = df_data.loc[idx]
+        # If we got a DataFrame (duplicate columns), convert to Series
+        if isinstance(row_data, pd.DataFrame):
+            row_values = row_data.iloc[0].astype(str)
+        else:
+            row_values = pd.Series(row_data).astype(str)
+        
         # Normalize row values for comparison
-        row_set = set(str(v).strip().lower() for v in row_values if str(v).strip())
+        # Ensure we iterate over scalar values, not Series
+        row_set = set()
+        for v in row_values:
+            # Skip if v is a Series (shouldn't happen, but defensive)
+            if isinstance(v, pd.Series):
+                continue
+            v_str = str(v).strip()
+            if v_str:
+                row_set.add(v_str.lower())
         
         # If the row contains a significant overlap with headers, it's likely a repeated header
         # We use a threshold: if >= 70% of non-empty row values match headers, consider it a header row
@@ -469,8 +541,25 @@ def detect_total_rows(df_data: pd.DataFrame) -> Tuple[pd.DataFrame, int, int]:
     dropped_indices = []
     
     for idx in df_data.index:
-        row = df_data.loc[idx]
-        row_str = ' '.join(str(v).lower() for v in row if pd.notna(v) and str(v).strip())
+        # Get row - handle case where duplicate columns might return DataFrame
+        row_data = df_data.loc[idx]
+        # If we got a DataFrame (duplicate columns), convert to Series
+        if isinstance(row_data, pd.DataFrame):
+            row = row_data.iloc[0]
+        else:
+            row = pd.Series(row_data)
+        
+        # Build row string safely, ensuring we handle scalar values
+        row_parts = []
+        for v in row:
+            # Skip if v is a Series (shouldn't happen, but defensive)
+            if isinstance(v, pd.Series):
+                continue
+            if safe_notna(v):
+                v_str = safe_str_strip(v)
+                if v_str:
+                    row_parts.append(v_str.lower())
+        row_str = ' '.join(row_parts)
         
         # Check if row contains total keywords
         is_total = any(keyword in row_str for keyword in total_keywords)
@@ -490,13 +579,19 @@ def detect_total_rows(df_data: pd.DataFrame) -> Tuple[pd.DataFrame, int, int]:
             numeric_count = 0
             non_empty_count = 0
             for val in row:
-                if pd.notna(val) and str(val).strip():
-                    non_empty_count += 1
-                    try:
-                        float(str(val).replace(',', '').replace('$', '').replace('%', ''))
-                        numeric_count += 1
-                    except (ValueError, AttributeError):
-                        pass
+                # Skip if val is a Series (shouldn't happen, but defensive)
+                if isinstance(val, pd.Series):
+                    continue
+                # Use safe helper functions to avoid Series boolean ambiguity
+                if safe_notna(val):
+                    val_str = safe_str_strip(val)
+                    if val_str:
+                        non_empty_count += 1
+                        try:
+                            float(val_str.replace(',', '').replace('$', '').replace('%', ''))
+                            numeric_count += 1
+                        except (ValueError, AttributeError):
+                            pass
             
             mostly_numeric = (numeric_count / non_empty_count >= 0.7) if non_empty_count > 0 else False
             
@@ -547,17 +642,118 @@ def detect_context_columns(df: pd.DataFrame, normalized_headers: List[str]) -> L
         if col in ['__possible_duplicate', '__is_total_row']:
             continue
         
-        series = df[col].astype(str)
+        # Ensure we get a Series (handle duplicate column names or edge cases)
+        try:
+            # Use iloc to get column by position if name access fails, or ensure Series
+            if col in df.columns:
+                col_data = df[col]
+                # If we got a DataFrame (duplicate columns), take first column
+                if isinstance(col_data, pd.DataFrame):
+                    series = col_data.iloc[:, 0].astype(str)
+                else:
+                    series = pd.Series(col_data).astype(str)
+            else:
+                continue
+        except (KeyError, IndexError):
+            continue
         
-        # Count blanks/empty values
-        blank_count = sum(1 for v in series if pd.isna(v) or str(v).strip() in ['', 'nan', 'None', 'null'])
+        # Ensure series is actually a Series
+        if not isinstance(series, pd.Series):
+            continue
+        
+        # Count blanks/empty values - use safe helper functions
+        blank_count = 0
+        for v in series:
+            # Use safe helper functions to avoid Series boolean ambiguity
+            if safe_isna(v):
+                blank_count += 1
+                continue
+            v_str = safe_str_strip(v)
+            if v_str in ['', 'nan', 'None', 'null']:
+                blank_count += 1
         blank_ratio = blank_count / n_rows if n_rows > 0 else 0
         
-        # Count unique non-blank values
-        non_blank = series[series.str.strip().notna() & (series.str.strip() != '') & 
-                          (series.str.strip() != 'nan') & (series.str.strip() != 'None')]
-        unique_count = non_blank.nunique() if len(non_blank) > 0 else 0
-        cardinality_ratio = unique_count / len(non_blank) if len(non_blank) > 0 else 1.0
+        # Count unique non-blank values - use safe string operations
+        non_blank = pd.Series(dtype=object)  # Initialize to empty Series
+        unique_count = 0
+        cardinality_ratio = 1.0
+        
+        try:
+            # Convert to string and filter safely
+            series_str = series.astype(str)
+            
+            # Build mask step by step to avoid ambiguous boolean operations
+            # Use explicit boolean Series operations
+            mask_notna = series_str.str.strip().notna()
+            mask_not_empty = (series_str.str.strip() != '')
+            mask_not_nan = (series_str.str.strip() != 'nan')
+            mask_not_none = (series_str.str.strip() != 'None')
+            
+            # Combine masks using & operator (element-wise for Series)
+            # Check each mask is a Series before combining
+            if (isinstance(mask_notna, pd.Series) and 
+                isinstance(mask_not_empty, pd.Series) and
+                isinstance(mask_not_nan, pd.Series) and
+                isinstance(mask_not_none, pd.Series)):
+                non_blank_mask = mask_notna & mask_not_empty & mask_not_nan & mask_not_none
+                # Ensure mask is a Series before using for indexing
+                if isinstance(non_blank_mask, pd.Series):
+                    non_blank = series[non_blank_mask]
+                else:
+                    # Fallback: filter manually using list comprehension
+                    # Use explicit checks to avoid Series boolean ambiguity
+                    non_blank_list = []
+                    for v in series:
+                        # Skip if v is a Series (shouldn't happen, but defensive)
+                        if isinstance(v, pd.Series):
+                            continue
+                        # Use explicit checks, not boolean operations on potential Series
+                        if safe_notna(v):
+                            v_str = safe_str_strip(v)
+                            if v_str and v_str.lower() not in ['nan', 'none', 'null']:
+                                non_blank_list.append(v)
+                    non_blank = pd.Series(non_blank_list) if non_blank_list else pd.Series(dtype=object)
+            else:
+                # Fallback: filter manually using list comprehension
+                # Use explicit checks to avoid Series boolean ambiguity
+                non_blank_list = []
+                for v in series:
+                    # Skip if v is a Series (shouldn't happen, but defensive)
+                    if isinstance(v, pd.Series):
+                        continue
+                    # Use safe helper functions to avoid Series boolean ambiguity
+                    if safe_notna(v):
+                        v_str = safe_str_strip(v)
+                        if v_str and v_str.lower() not in ['nan', 'none', 'null']:
+                            non_blank_list.append(v)
+                non_blank = pd.Series(non_blank_list) if non_blank_list else pd.Series(dtype=object)
+            
+            # Use explicit length check to avoid Series boolean ambiguity
+            non_blank_len = len(non_blank) if isinstance(non_blank, pd.Series) else 0
+            unique_count = non_blank.nunique() if non_blank_len > 0 else 0
+            cardinality_ratio = unique_count / non_blank_len if non_blank_len > 0 else 1.0
+        except (AttributeError, TypeError, ValueError) as e:
+            # Fallback if .str accessor fails or boolean operation fails
+            try:
+                # More defensive approach
+                non_blank_list = []
+                for val in series:
+                    # Skip if val is a Series (shouldn't happen, but defensive)
+                    if isinstance(val, pd.Series):
+                        continue
+                    # Use explicit checks to avoid Series boolean ambiguity
+                    if safe_notna(val):
+                        val_str = safe_str_strip(val)
+                        if val_str and val_str.lower() not in ['nan', 'none', 'null']:
+                            non_blank_list.append(val)
+                non_blank = pd.Series(non_blank_list) if non_blank_list else pd.Series(dtype=object)
+                unique_count = non_blank.nunique() if len(non_blank) > 0 else 0
+                cardinality_ratio = unique_count / len(non_blank) if len(non_blank) > 0 else 1.0
+            except Exception:
+                # Ultimate fallback
+                non_blank = pd.Series(dtype=object)
+                unique_count = 0
+                cardinality_ratio = 1.0
         
         # Check if column name suggests category
         col_lower = str(col).lower()
@@ -567,9 +763,11 @@ def detect_context_columns(df: pd.DataFrame, normalized_headers: List[str]) -> L
         # 1. High blank ratio (>= 30%) AND low cardinality (< 20% unique), OR
         # 2. Very low cardinality (< 10% unique) regardless of blanks, OR
         # 3. Has category keyword AND (high blanks OR low cardinality)
+        # Use explicit length check to avoid Series boolean ambiguity
+        non_blank_len = len(non_blank) if isinstance(non_blank, pd.Series) else 0
         is_context = (
             (blank_ratio >= 0.3 and cardinality_ratio < 0.2) or
-            (cardinality_ratio < 0.1 and len(non_blank) > 0) or
+            (cardinality_ratio < 0.1 and non_blank_len > 0) or
             (has_category_keyword and (blank_ratio >= 0.2 or cardinality_ratio < 0.3))
         )
         
@@ -600,8 +798,21 @@ def fill_down_context(df: pd.DataFrame, context_columns: List[str]) -> pd.DataFr
         if col not in df_filled.columns:
             continue
         
-        # Convert to string for processing
-        series = df_filled[col].astype(str)
+        # Ensure we get a Series (handle duplicate column names or edge cases)
+        try:
+            col_data = df_filled[col]
+            # If we got a DataFrame (duplicate columns), take first column
+            if isinstance(col_data, pd.DataFrame):
+                series = col_data.iloc[:, 0].astype(str)
+            else:
+                series = pd.Series(col_data).astype(str)
+        except (KeyError, IndexError, TypeError):
+            continue
+        
+        # Ensure series is actually a Series
+        if not isinstance(series, pd.Series):
+            continue
+        
         filled_series = series.copy()
         
         # Track last non-blank value
@@ -609,7 +820,14 @@ def fill_down_context(df: pd.DataFrame, context_columns: List[str]) -> pd.DataFr
         
         for idx in df_filled.index:
             val = series.loc[idx]
-            val_str = str(val).strip() if pd.notna(val) else ''
+            # Use explicit checks to avoid Series boolean ambiguity
+            if isinstance(val, pd.Series):
+                val_str = ''
+            else:
+                if safe_notna(val):
+                    val_str = safe_str_strip(val)
+                else:
+                    val_str = ''
             
             # Check if blank/empty
             is_blank = (val_str == '' or val_str.lower() in ['nan', 'none', 'null'])
@@ -654,8 +872,9 @@ def clean_single_sheet(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         "context_columns_filled": [],
         "rows_in": rows_in,
         "rows_out": 0,
-        "warnings": [],
-        "errors": [],
+        "info": [],  # Informational messages (successful fixes)
+        "warnings": [],  # Things user should review
+        "errors": [],  # Things that failed
     }
 
     if df.empty:
@@ -682,15 +901,17 @@ def clean_single_sheet(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     df_data.columns = normalized_headers
     metadata["duplicate_column_names_fixed"] = dup_col_count
     
+    # Move successful fixes to INFO (not warnings)
     if dup_col_count > 0:
-        metadata["warnings"].append(f"Fixed {dup_col_count} duplicate column name(s).")
+        metadata["info"].append(f"Fixed {dup_col_count} duplicate column name(s).")
     
     # Detect and remove repeated header rows
     df_data, repeated_header_count = detect_repeated_headers(df_data, normalized_headers)
     metadata["repeated_header_rows_dropped"] = repeated_header_count
     
+    # Move successful fixes to INFO (not warnings)
     if repeated_header_count > 0:
-        metadata["warnings"].append(f"Removed {repeated_header_count} repeated header row(s).")
+        metadata["info"].append(f"Removed {repeated_header_count} repeated header row(s).")
     
     df_data = df_data.dropna(how="all")
     
@@ -700,8 +921,12 @@ def clean_single_sheet(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         metadata["totals_rows_flagged"] = totals_flagged
         metadata["totals_rows_dropped"] = totals_dropped
         
+        # Only warn if totals were flagged but not removed (needs review)
         if totals_flagged > 0:
-            metadata["warnings"].append(f"Flagged {totals_flagged} potential total row(s), removed {totals_dropped} high-confidence total(s).")
+            if totals_dropped > 0:
+                metadata["info"].append(f"Removed {totals_dropped} total row(s).")
+            if totals_flagged > totals_dropped:
+                metadata["warnings"].append(f"{totals_flagged - totals_dropped} potential total row(s) flagged for review.")
     
     # Detect and fill down context columns
     if not df_data.empty:
@@ -709,7 +934,8 @@ def clean_single_sheet(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         if context_columns:
             df_data = fill_down_context(df_data, context_columns)
             metadata["context_columns_filled"] = context_columns
-            metadata["warnings"].append(f"Applied fill-down to {len(context_columns)} context column(s): {', '.join(context_columns[:3])}{'...' if len(context_columns) > 3 else ''}")
+            # Move successful fixes to INFO (not warnings)
+            metadata["info"].append(f"Applied fill-down to {len(context_columns)} context column(s): {', '.join(context_columns[:3])}{'...' if len(context_columns) > 3 else ''}")
 
     if not df_data.empty:
         df_data["__possible_duplicate"] = df_data.duplicated(keep=False)
@@ -726,6 +952,397 @@ def clean_single_sheet(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
             metadata["warnings"].append(f"Significant row reduction: {rows_in} → {metadata['rows_out']} rows ({reduction_ratio*100:.1f}% reduction).")
 
     return df_data, metadata
+
+
+# -----------------------------
+# HELPER FUNCTIONS FOR SAFE VALUE HANDLING
+# -----------------------------
+
+def safe_isna(val: Any) -> bool:
+    """
+    Safely check if a value is NA, handling Series objects.
+    Returns True if val is a Series (to skip it) or if it's NA.
+    """
+    if isinstance(val, pd.Series):
+        return True  # Treat Series as NA to skip
+    try:
+        # pd.isna returns scalar bool for scalar values, Series for Series
+        result = pd.isna(val)
+        # If result is a Series, it means val was somehow a Series (shouldn't happen after isinstance check)
+        if isinstance(result, pd.Series):
+            return True  # Treat as NA
+        # Otherwise, result is a scalar bool
+        return bool(result)
+    except (ValueError, TypeError):
+        # If pd.isna fails, assume not NA
+        return False
+
+def safe_notna(val: Any) -> bool:
+    """
+    Safely check if a value is not NA, handling Series objects.
+    Returns False if val is a Series (to skip it) or if it's NA.
+    """
+    if isinstance(val, pd.Series):
+        return False  # Treat Series as NA to skip
+    try:
+        # pd.notna returns scalar bool for scalar values, Series for Series
+        result = pd.notna(val)
+        # If result is a Series, it means val was somehow a Series (shouldn't happen after isinstance check)
+        if isinstance(result, pd.Series):
+            return False  # Treat as NA
+        # Otherwise, result is a scalar bool
+        return bool(result)
+    except (ValueError, TypeError):
+        # If pd.notna fails, assume not NA
+        return True
+
+def safe_str_strip(val: Any) -> str:
+    """
+    Safely convert value to string and strip, handling Series objects.
+    Returns empty string if val is a Series.
+    """
+    if isinstance(val, pd.Series):
+        return ''
+    try:
+        return str(val).strip()
+    except (ValueError, TypeError, AttributeError):
+        return ''
+
+# -----------------------------
+# DATA SANITIZATION FOR SQL
+# -----------------------------
+
+def sanitize_for_sql(df: pd.DataFrame, type_analysis: Dict[str, Dict]) -> pd.DataFrame:
+    """
+    Sanitize DataFrame for SQL export:
+    - Convert NULL values (empty strings, 'nan', 'None', 'null' text) to pd.NA
+    - Standardize date formats to ISO 8601
+    - Sanitize special characters (control characters, problematic Unicode)
+    - Convert numeric columns to proper types where appropriate
+    
+    Args:
+        df: DataFrame to sanitize
+        type_analysis: Type analysis dict from analyze_column_types()
+    
+    Returns:
+        Sanitized DataFrame ready for SQL export
+    """
+    if df.empty:
+        return df
+    
+    df_sanitized = df.copy()
+    
+    # Remove internal columns from processing
+    internal_cols = ['__possible_duplicate', '__is_total_row']
+    data_cols = [c for c in df_sanitized.columns if c not in internal_cols]
+    
+    for col in data_cols:
+        if col not in df_sanitized.columns:
+            continue
+        
+        col_analysis = type_analysis.get(col, {})
+        recommended_type = col_analysis.get('recommended_type', 'VARCHAR')
+        
+        # Convert NULL-like values to pd.NA
+        # Replace empty strings, 'nan', 'None', 'null' (as text) with pd.NA
+        df_sanitized[col] = df_sanitized[col].replace([
+            '', 'nan', 'None', 'null', 'NULL', 'NaN', 'N/A', 'n/a'
+        ], pd.NA)
+        
+        # Handle dates: convert to ISO 8601 format
+        if recommended_type in ('DATE', 'TIMESTAMP_NTZ'):
+            df_sanitized[col] = standardize_dates(df_sanitized[col], recommended_type)
+        
+        # Sanitize special characters (for all string columns)
+        if recommended_type == 'VARCHAR':
+            df_sanitized[col] = df_sanitized[col].apply(sanitize_string_value)
+        
+        # Convert numeric types (but keep as string for CSV - type conversion happens in SQL)
+        # We'll validate ranges but keep as string to preserve precision
+        if recommended_type in ('INTEGER', 'FLOAT'):
+            df_sanitized[col] = validate_numeric_values(df_sanitized[col], recommended_type)
+    
+    return df_sanitized
+
+
+def sanitize_string_value(val: Any) -> str:
+    """
+    Sanitize a single string value for SQL export.
+    - Removes or replaces control characters
+    - Normalizes problematic Unicode
+    - Preserves NULL as pd.NA
+    
+    Args:
+        val: Value to sanitize
+    
+    Returns:
+        Sanitized string or pd.NA
+    """
+    # Use safe helper function to avoid Series boolean ambiguity
+    if safe_isna(val):
+        return pd.NA
+    
+    val_str = str(val)
+    
+    # Remove control characters except tab, newline, carriage return
+    # Replace with space or remove based on character
+    # Keep: \t (tab), \n (newline), \r (carriage return)
+    # Remove: other control chars (0x00-0x1F except 0x09, 0x0A, 0x0D)
+    sanitized = []
+    for char in val_str:
+        code = ord(char)
+        if code < 32:  # Control character range
+            if code in (9, 10, 13):  # Tab, newline, carriage return - keep
+                sanitized.append(char)
+            # else: skip other control characters
+        elif code == 127:  # DEL character
+            continue
+        else:
+            sanitized.append(char)
+    
+    result = ''.join(sanitized)
+    
+    # Return pd.NA if result is empty after sanitization
+    if not result.strip():
+        return pd.NA
+    
+    return result
+
+
+def standardize_dates(series: pd.Series, date_type: str) -> pd.Series:
+    """
+    Standardize date values to ISO 8601 format.
+    
+    Args:
+        series: Series with date values (as strings)
+        date_type: 'DATE' or 'TIMESTAMP_NTZ'
+    
+    Returns:
+        Series with standardized date strings or pd.NA
+    """
+    result = series.copy()
+    date_only_formats = [
+        '%Y-%m-%d',
+        '%m/%d/%Y',
+        '%d/%m/%Y',
+        '%Y/%m/%d',
+        '%d-%m-%Y',
+        '%m-%d-%Y',
+    ]
+    timestamp_formats = [
+        '%Y-%m-%d %H:%M:%S',
+        '%m/%d/%Y %H:%M:%S',
+        '%d/%m/%Y %H:%M:%S',
+        '%Y-%m-%dT%H:%M:%S',
+        '%Y/%m/%d %H:%M:%S',
+        '%d/%m/%Y %H:%M:%S',
+        '%Y-%m-%d %H:%M:%S.%f',
+        '%Y-%m-%dT%H:%M:%S.%f',
+    ]
+    
+    for idx in result.index:
+        val = result.loc[idx]
+        # Use safe helper functions to avoid Series boolean ambiguity
+        if safe_isna(val):
+            continue
+        
+        val_str = str(val).strip()
+        if val_str == '' or val_str.lower() in ['nan', 'none', 'null']:
+            result.loc[idx] = pd.NA
+            continue
+        
+        # Try to parse and reformat
+        parsed = None
+        for fmt in (timestamp_formats if date_type == 'TIMESTAMP_NTZ' else date_only_formats):
+            try:
+                parsed = datetime.strptime(val_str, fmt)
+                break
+            except ValueError:
+                continue
+        
+        # If parsing failed, try pandas' flexible parser
+        if parsed is None:
+            try:
+                parsed = pd.to_datetime(val_str, errors='raise', infer_datetime_format=True)
+            except (ValueError, TypeError):
+                result.loc[idx] = pd.NA
+                continue
+        
+        # Format to ISO 8601
+        if date_type == 'TIMESTAMP_NTZ':
+            result.loc[idx] = parsed.strftime('%Y-%m-%dT%H:%M:%S')
+        else:  # DATE
+            result.loc[idx] = parsed.strftime('%Y-%m-%d')
+    
+    return result
+
+
+def validate_data_for_sql(df: pd.DataFrame, type_analysis: Dict[str, Dict]) -> Dict[str, List[str]]:
+    """
+    Validate data against SQL constraints and return warnings.
+    
+    Args:
+        df: DataFrame to validate
+        type_analysis: Type analysis dict from analyze_column_types()
+    
+    Returns:
+        Dict with 'warnings' and 'errors' lists
+    """
+    validation_results = {
+        'warnings': [],
+        'errors': []
+    }
+    
+    if df.empty:
+        return validation_results
+    
+    internal_cols = ['__possible_duplicate', '__is_total_row']
+    data_cols = [c for c in df.columns if c not in internal_cols]
+    
+    for col in data_cols:
+        if col not in df.columns:
+            continue
+        
+        col_analysis = type_analysis.get(col, {})
+        recommended_type = col_analysis.get('recommended_type', 'VARCHAR')
+        
+        # Ensure we get a Series (handle duplicate column names or edge cases)
+        try:
+            col_data = df[col]
+            if isinstance(col_data, pd.DataFrame):
+                series = col_data.iloc[:, 0].dropna()
+            else:
+                series = pd.Series(col_data).dropna()
+        except (KeyError, IndexError, TypeError):
+            continue
+        
+        if not isinstance(series, pd.Series) or series.empty:
+            continue
+        
+        # Validate VARCHAR length (only warn for very large values)
+        if recommended_type == 'VARCHAR':
+            max_len = 0
+            long_values = []
+            for val in series:
+                val_str = str(val)
+                byte_len = len(val_str.encode('utf-8'))
+                if byte_len > max_len:
+                    max_len = byte_len
+                if byte_len > 16777216:  # Snowflake VARCHAR max
+                    long_values.append((val_str[:50] + '...' if len(val_str) > 50 else val_str, byte_len))
+            
+            if long_values:
+                validation_results['errors'].append(
+                    f"Column '{col}': {len(long_values)} value(s) exceed Snowflake VARCHAR max (16MB)"
+                )
+            # Only warn for very large values (>100KB) - reduce noise
+            elif max_len > 100000:
+                validation_results['warnings'].append(
+                    f"Column '{col}': Contains very large values (max {max_len:,} bytes) - consider VARIANT type for >16MB"
+                )
+        
+        # Validate INTEGER range
+        elif recommended_type == 'INTEGER':
+            invalid_count = 0
+            for val in series:
+                try:
+                    val_str = str(val).replace(',', '').replace('$', '').strip()
+                    int_val = int(float(val_str))
+                    # Check Python int range (Snowflake INTEGER is similar)
+                    if int_val < -99999999999999999999999999999999999999 or int_val > 99999999999999999999999999999999999999:
+                        invalid_count += 1
+                except (ValueError, OverflowError):
+                    invalid_count += 1
+            
+            if invalid_count > 0:
+                validation_results['warnings'].append(
+                    f"Column '{col}': {invalid_count} value(s) cannot be converted to INTEGER"
+                )
+        
+        # Validate FLOAT range
+        elif recommended_type == 'FLOAT':
+            invalid_count = 0
+            for val in series:
+                try:
+                    val_str = str(val).replace(',', '').replace('$', '').strip()
+                    float_val = float(val_str)
+                    if not math.isfinite(float_val):
+                        invalid_count += 1
+                except (ValueError, OverflowError):
+                    invalid_count += 1
+            
+            if invalid_count > 0:
+                validation_results['warnings'].append(
+                    f"Column '{col}': {invalid_count} value(s) cannot be converted to FLOAT"
+                )
+        
+        # Validate DATE/TIMESTAMP format (only warn if significant portion is invalid)
+        elif recommended_type in ('DATE', 'TIMESTAMP_NTZ'):
+            invalid_count = 0
+            total_count = len(series)
+            for val in series:
+                val_str = str(val).strip()
+                try:
+                    # Try to parse as date
+                    pd.to_datetime(val_str, errors='raise')
+                except (ValueError, TypeError):
+                    invalid_count += 1
+            
+            # Only warn if >10% of values are invalid (reduce noise for edge cases)
+            if invalid_count > 0 and (invalid_count / total_count) > 0.1:
+                validation_results['warnings'].append(
+                    f"Column '{col}': {invalid_count} of {total_count} value(s) ({invalid_count/total_count*100:.1f}%) may not be valid {recommended_type} format"
+                )
+    
+    return validation_results
+
+
+def validate_numeric_values(series: pd.Series, numeric_type: str) -> pd.Series:
+    """
+    Validate numeric values and keep as string (for CSV export).
+    Invalid values become pd.NA.
+    
+    Args:
+        series: Series with numeric values (as strings)
+        numeric_type: 'INTEGER' or 'FLOAT'
+    
+    Returns:
+        Series with validated numeric strings or pd.NA
+    """
+    result = series.copy()
+    
+    for idx in result.index:
+        val = result.loc[idx]
+        # Use safe helper functions to avoid Series boolean ambiguity
+        if safe_isna(val):
+            continue
+        
+        val_str = str(val).strip()
+        if val_str == '' or val_str.lower() in ['nan', 'none', 'null']:
+            result.loc[idx] = pd.NA
+            continue
+        
+        # Try to parse as number
+        try:
+            # Remove common formatting
+            clean_val = val_str.replace(',', '').replace('$', '').replace('%', '').strip()
+            
+            if numeric_type == 'INTEGER':
+                int_val = int(float(clean_val))  # Convert via float to handle "123.0"
+                # Check range (Snowflake INTEGER is -99999999999999999999999999999999999999 to 99999999999999999999999999999999999999)
+                # For practical purposes, we'll use Python int limits
+                result.loc[idx] = str(int_val)
+            else:  # FLOAT
+                float_val = float(clean_val)
+                # Check for infinity/NaN
+                if math.isfinite(float_val):
+                    result.loc[idx] = str(float_val)
+                else:
+                    result.loc[idx] = pd.NA
+        except (ValueError, OverflowError):
+            result.loc[idx] = pd.NA
+    
+    return result
 
 
 # -----------------------------
@@ -754,9 +1371,17 @@ def analyze_column_types(df: pd.DataFrame) -> Dict[str, Dict]:
     cols = [c for c in df.columns if c != "__possible_duplicate"]
     
     for col in cols:
-        series = df[col].dropna().astype(str)
+        # Ensure we get a Series (handle duplicate column names or edge cases)
+        try:
+            col_data = df[col]
+            if isinstance(col_data, pd.DataFrame):
+                series = col_data.iloc[:, 0].dropna().astype(str)
+            else:
+                series = pd.Series(col_data).dropna().astype(str)
+        except (KeyError, IndexError, TypeError):
+            continue
         
-        if series.empty:
+        if not isinstance(series, pd.Series) or series.empty:
             type_analysis[col] = {
                 'pct_int': 0.0,
                 'pct_float': 0.0,
@@ -858,6 +1483,157 @@ def analyze_column_types(df: pd.DataFrame) -> Dict[str, Dict]:
 
 
 # -----------------------------
+# SQL STATEMENT GENERATION
+# -----------------------------
+
+def generate_create_table_statements(
+    cleaned_sheets: Dict[str, pd.DataFrame],
+    sheet_metadata: Dict[str, Dict],
+    type_analysis_df: pd.DataFrame
+) -> str:
+    """
+    Generate CREATE TABLE SQL statements for all cleaned sheets.
+    Uses Snowflake SQL syntax.
+    
+    Args:
+        cleaned_sheets: Dict of sheet_name -> DataFrame
+        sheet_metadata: Dict of sheet_name -> metadata dict
+        type_analysis_df: DataFrame with type analysis
+    
+    Returns:
+        String containing all CREATE TABLE statements
+    """
+    sql_statements = []
+    sql_statements.append("-- SQL DDL statements for Snowflake")
+    sql_statements.append("-- Generated automatically from normalized spreadsheet")
+    sql_statements.append("-- Review and adjust data types as needed")
+    sql_statements.append("")
+    
+    # Create a lookup for type recommendations
+    type_lookup = {}
+    if not type_analysis_df.empty and 'Tab name' in type_analysis_df.columns:
+        for _, row in type_analysis_df.iterrows():
+            tab_name = row.get('Tab name', '')
+            col_name = row.get('Column name', '')
+            rec_type = row.get('Recommended Snowflake type', 'VARCHAR')
+            if tab_name and col_name:
+                if tab_name not in type_lookup:
+                    type_lookup[tab_name] = {}
+                type_lookup[tab_name][col_name] = rec_type
+    
+    for sheet_name, df in cleaned_sheets.items():
+        if df.empty:
+            continue
+        
+        # Sanitize table name (same rules as column names)
+        table_name = sanitize_identifier(sheet_name)
+        if not table_name or table_name[0].isdigit():
+            table_name = f"table_{table_name}"
+        if table_name in SQL_RESERVED_WORDS:
+            table_name = f"{table_name}_tbl"
+        if len(table_name) > 255:
+            table_name = table_name[:252] + "..."
+        
+        sql_statements.append(f"-- Table: {sheet_name}")
+        sql_statements.append(f"CREATE TABLE {table_name} (")
+        
+        # Get type recommendations for this sheet
+        sheet_types = type_lookup.get(sheet_name, {})
+        
+        columns = []
+        for col in df.columns:
+            if col in ['__possible_duplicate', '__is_total_row']:
+                continue
+            
+            # Get recommended type
+            rec_type = sheet_types.get(col, 'VARCHAR')
+            
+            # Determine size for VARCHAR
+            if rec_type == 'VARCHAR':
+                # Calculate max length in this column
+                max_len = 0
+                for val in df[col].dropna():
+                    val_str = str(val)
+                    # Estimate UTF-8 byte length (rough approximation)
+                    byte_len = len(val_str.encode('utf-8'))
+                    max_len = max(max_len, byte_len)
+                
+                # Add 20% buffer and round up to reasonable sizes
+                if max_len == 0:
+                    varchar_size = 16777216  # Snowflake default VARCHAR max
+                elif max_len < 100:
+                    varchar_size = 255
+                elif max_len < 500:
+                    varchar_size = 500
+                elif max_len < 2000:
+                    varchar_size = 2000
+                elif max_len < 10000:
+                    varchar_size = 10000
+                else:
+                    varchar_size = 16777216  # Snowflake max
+                
+                type_def = f"VARCHAR({varchar_size})"
+            else:
+                type_def = rec_type
+            
+            # Sanitize column name (should already be done, but double-check)
+            col_safe = sanitize_identifier(col)
+            if not col_safe or col_safe[0].isdigit():
+                col_safe = f"col_{col_safe}"
+            if col_safe in SQL_RESERVED_WORDS:
+                col_safe = f"{col_safe}_col"
+            
+            columns.append(f"    {col_safe} {type_def}")
+        
+        sql_statements.append(",\n".join(columns))
+        sql_statements.append(");")
+        sql_statements.append("")
+    
+    return "\n".join(sql_statements)
+
+
+def sanitize_identifier(identifier: str) -> str:
+    """
+    Sanitize an identifier (table or column name) for SQL.
+    Applies same rules as normalise_headers but for a single identifier.
+    
+    Args:
+        identifier: Identifier to sanitize
+    
+    Returns:
+        SQL-safe identifier
+    """
+    if not identifier:
+        return "unnamed"
+    
+    # Normalize: lowercase, underscores, remove special chars
+    clean = (
+        str(identifier)
+        .strip()
+        .lower()
+        .replace(' ', '_')
+    )
+    clean = re.sub(r'[^\w]', '', clean)
+    
+    if not clean or clean == "nan":
+        return "unnamed"
+    
+    # Fix numeric start
+    if clean[0].isdigit():
+        clean = f"col_{clean}"
+    
+    # Fix reserved words
+    if clean in SQL_RESERVED_WORDS:
+        clean = f"{clean}_col"
+    
+    # Fix length
+    if len(clean) > 255:
+        clean = clean[:252] + "..."
+    
+    return clean
+
+
+# -----------------------------
 # CANDIDATE KEYS
 # -----------------------------
 
@@ -877,8 +1653,17 @@ def find_candidate_keys(df: pd.DataFrame) -> list:
     cols = [c for c in df.columns if c != "__possible_duplicate"]
 
     for col in cols:
-        series = df[col].dropna().astype(str)
-        if series.empty:
+        # Ensure we get a Series (handle duplicate column names or edge cases)
+        try:
+            col_data = df[col]
+            if isinstance(col_data, pd.DataFrame):
+                series = col_data.iloc[:, 0].dropna().astype(str)
+            else:
+                series = pd.Series(col_data).dropna().astype(str)
+        except (KeyError, IndexError, TypeError):
+            continue
+        
+        if not isinstance(series, pd.Series) or series.empty:
             continue
 
         fill_ratio = len(series) / n_rows
@@ -960,6 +1745,7 @@ def normalize_spreadsheet(
     all_type_analysis = []  # Collect detailed type analysis for TYPE_ANALYSIS sheet
     all_errors = []
     all_warnings = []
+    all_info = []  # Collect informational messages (successful fixes)
 
     for sheet_name in xl.sheet_names:
         try:
@@ -977,7 +1763,30 @@ def normalize_spreadsheet(
                                           region['min_col']:region['max_col']].copy()
                 
                 # Process this region
-                df_clean, clean_metadata = clean_single_sheet(region_df_raw)
+                try:
+                    df_clean, clean_metadata = clean_single_sheet(region_df_raw)
+                except ValueError as e:
+                    # Catch "ambiguous truth value" errors and provide better error message
+                    if "truth value" in str(e).lower() or "ambiguous" in str(e).lower():
+                        error_msg = f"Data structure issue in sheet '{sheet_name}': {str(e)}. This may be due to duplicate columns or unusual data structure. The sheet will be skipped."
+                        all_errors.append(f"{virtual_sheet_name}: {error_msg}")
+                        clean_metadata = {
+                            "duplicate_column_names_fixed": 0,
+                            "repeated_header_rows_dropped": 0,
+                            "totals_rows_dropped": 0,
+                            "totals_rows_flagged": 0,
+                            "header_row_index": 0,
+                            "header_depth_used": 1,
+                            "context_columns_filled": [],
+                            "rows_in": len(region_df_raw),
+                            "rows_out": 0,
+                            "info": [],
+                            "warnings": [],
+                            "errors": [error_msg],
+                        }
+                        df_clean = pd.DataFrame()  # Empty DataFrame for failed sheets
+                    else:
+                        raise  # Re-raise if it's a different ValueError
                 
                 # Create virtual sheet name
                 if len(regions) > 1:
@@ -1002,10 +1811,12 @@ def normalize_spreadsheet(
                 rows_out = clean_metadata.get("rows_out", 0)
                 warnings = clean_metadata.get("warnings", [])
                 errors = clean_metadata.get("errors", [])
+                info = clean_metadata.get("info", [])
                 
-                # Collect warnings and errors
-                all_warnings.extend(warnings)
-                all_errors.extend(errors)
+                # Collect info, warnings, and errors separately
+                all_info.extend([f"{virtual_sheet_name}: {i}" for i in info])
+                all_warnings.extend([f"{virtual_sheet_name}: {w}" for w in warnings])
+                all_errors.extend([f"{virtual_sheet_name}: {e}" for e in errors])
                 
                 # Add warning if multiple tables detected
                 if len(regions) > 1:
@@ -1013,6 +1824,15 @@ def normalize_spreadsheet(
                 
                 # Analyze column types
                 type_analysis = analyze_column_types(df_clean)
+                
+                # Validate data for SQL constraints
+                validation_results = validate_data_for_sql(df_clean, type_analysis)
+                if validation_results['warnings']:
+                    clean_metadata['warnings'].extend(validation_results['warnings'])
+                    all_warnings.extend([f"{virtual_sheet_name}: {w}" for w in validation_results['warnings']])
+                if validation_results['errors']:
+                    clean_metadata['errors'].extend(validation_results['errors'])
+                    all_errors.extend([f"{virtual_sheet_name}: {e}" for e in validation_results['errors']])
                 
                 # Create type summary string for META sheet
                 type_summary_parts = []
@@ -1024,6 +1844,10 @@ def normalize_spreadsheet(
                 type_summary = ", ".join([f"{k}({v})" for k, v in sorted(type_counts.items())])
                 if not type_summary:
                     type_summary = "N/A"
+
+                # Sanitize data for SQL export (dates, NULLs, special chars)
+                # This ensures both Excel and CSV outputs are SQL-ready
+                df_clean = sanitize_for_sql(df_clean, type_analysis)
 
                 cleaned_sheets[virtual_sheet_name] = df_clean
                 # Store full type analysis in metadata for potential future use
@@ -1170,6 +1994,9 @@ def normalize_spreadsheet(
             metadata = sheet_metadata.get(virtual_sheet_name, {})
             source_tab = metadata.get('source_tab', virtual_sheet_name)
             source_table_id = metadata.get('source_table_id', '')
+            
+            # Data is already sanitized before storing in cleaned_sheets
+            # No need to sanitize again here
 
             # Add source_tab and source_table_id columns
             df_copy.insert(0, "source_tab", source_tab)
@@ -1183,7 +2010,21 @@ def normalize_spreadsheet(
 
         if all_frames:
             combined = pd.concat(all_frames, ignore_index=True, sort=False)
-            combined.to_csv(csv_output_file, index=False)
+            
+            # Export CSV with SQL-optimized settings
+            # - UTF-8 encoding (required for Snowflake)
+            # - Proper quoting for fields with commas/quotes/newlines
+            # - Explicit NULL handling (empty strings become empty, pd.NA becomes empty)
+            combined.to_csv(
+                csv_output_file,
+                index=False,
+                encoding='utf-8',
+                quoting=csv.QUOTE_MINIMAL,  # Quote only when necessary
+                escapechar=None,  # Use double quotes for escaping
+                doublequote=True,  # Double quotes within quoted fields
+                na_rep='',  # Represent NULL/NA as empty string (SQL standard)
+                lineterminator='\n'  # Unix line endings (Snowflake compatible) - FIXED: was line_terminator
+            )
             csv_output_path = csv_output_file
 
     # Determine status
@@ -1204,6 +2045,22 @@ def normalize_spreadsheet(
     # Create type_analysis_df
     type_analysis_df = pd.DataFrame(all_type_analysis) if all_type_analysis else pd.DataFrame()
 
+    # Generate SQL CREATE TABLE statements
+    sql_output_path = None
+    if cleaned_sheets:
+        sql_output_file = output_dir / f"clean_{input_path.stem}_CREATE_TABLES.sql"
+        try:
+            sql_statements = generate_create_table_statements(
+                cleaned_sheets,
+                sheet_metadata,
+                type_analysis_df
+            )
+            with open(sql_output_file, 'w', encoding='utf-8') as f:
+                f.write(sql_statements)
+            sql_output_path = sql_output_file
+        except Exception as e:
+            all_warnings.append(f"Could not generate SQL file: {str(e)}")
+
     return {
         'job_id': job_id,
         'cleaned_sheets': cleaned_sheets,
@@ -1212,9 +2069,11 @@ def normalize_spreadsheet(
         'sheet_metadata': sheet_metadata,
         'excel_output_path': excel_output_path,
         'csv_output_path': csv_output_path,
+        'sql_output_path': sql_output_path,
         'status': status,
-        'errors': all_errors,
-        'warnings': all_warnings,
+        'info': all_info,  # Informational messages (successful fixes)
+        'warnings': all_warnings,  # Things user should review
+        'errors': all_errors,  # Things that failed
     }
 
 

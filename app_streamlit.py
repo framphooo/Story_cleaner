@@ -1518,17 +1518,45 @@ def create_run_report_excel(results, job_id, file_name, output_format, job_dir):
     errors_list = []
     info_list = []
     
-    # Process warnings and classify
-    for warning in results['warnings']:
-        warning_str = str(warning)
-        if 'split into' in warning_str.lower() or 'split sheet' in warning_str.lower():
-            info_list.append({'table': 'N/A', 'category': 'INFO', 'message': warning_str})
-        else:
-            warnings_list.append({'table': 'N/A', 'category': 'WARNING', 'message': warning_str})
+    # Process info messages (successful fixes) - NEW
+    if 'info' in results and results['info']:
+        for info_msg in results['info']:
+            info_str = str(info_msg)
+            # Extract table name if present (format: "TableName: message")
+            if ':' in info_str:
+                parts = info_str.split(':', 1)
+                table_name = parts[0].strip()
+                message = parts[1].strip()
+            else:
+                table_name = 'N/A'
+                message = info_str
+            info_list.append({'table': table_name, 'category': 'INFO', 'message': message})
     
-    # Process errors
-    for error in results['errors']:
-        errors_list.append({'table': 'N/A', 'category': 'ERROR', 'message': str(error)})
+    # Process warnings (things to review)
+    for warning in results.get('warnings', []):
+        warning_str = str(warning)
+        # Extract table name if present
+        if ':' in warning_str:
+            parts = warning_str.split(':', 1)
+            table_name = parts[0].strip()
+            message = parts[1].strip()
+        else:
+            table_name = 'N/A'
+            message = warning_str
+        warnings_list.append({'table': table_name, 'category': 'WARNING', 'message': message})
+    
+    # Process errors (things that failed)
+    for error in results.get('errors', []):
+        error_str = str(error)
+        # Extract table name if present
+        if ':' in error_str:
+            parts = error_str.split(':', 1)
+            table_name = parts[0].strip()
+            message = parts[1].strip()
+        else:
+            table_name = 'N/A'
+            message = error_str
+        errors_list.append({'table': table_name, 'category': 'ERROR', 'message': message})
     
     # Add table-specific warnings and errors from meta_df
     if not results['meta_df'].empty:
@@ -1871,6 +1899,29 @@ def aggregate_and_classify_messages(results):
             'summary': f"Sheet split into multiple tables: {len(split_info)} split(s) detected",
             'details': split_info,
             'type': 'split'
+        })
+    
+    # Process info messages from results (successful fixes) - NEW
+    info_list_from_results = []
+    if 'info' in results and results['info']:
+        for info_msg in results['info']:
+            info_str = str(info_msg)
+            # Extract table name if present (format: "TableName: message")
+            if ':' in info_str:
+                parts = info_str.split(':', 1)
+                table_name = parts[0].strip()
+                message = parts[1].strip()
+            else:
+                table_name = 'N/A'
+                message = info_str
+            info_list_from_results.append({'table': table_name, 'message': message})
+    
+    # Add info messages from results (successful fixes)
+    for info_item in info_list_from_results:
+        info_list.append({
+            'summary': info_item.get('message', ''),
+            'details': [],
+            'type': 'success'
         })
     
     return info_list, warnings_list, errors_list
@@ -2371,7 +2422,7 @@ if st.session_state.results is not None:
     # Downloads section (moved up, right after Results)
     st.markdown("### Downloads")
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         excel_exists = results.get('excel_output_path') and results['excel_output_path'].exists()
@@ -2416,6 +2467,29 @@ if st.session_state.results is not None:
             )
     
     with col3:
+        sql_exists = results.get('sql_output_path') and results['sql_output_path'].exists()
+        if sql_exists:
+            with open(results['sql_output_path'], 'rb') as f:
+                st.download_button(
+                    label="Download SQL",
+                    data=f.read(),
+                    file_name=results['sql_output_path'].name,
+                    mime="text/plain",
+                    disabled=False,
+                    key="dl_sql_main",
+                    help="CREATE TABLE statements for Snowflake"
+                )
+        else:
+            st.download_button(
+                label="Download SQL",
+                data=b"",
+                file_name="",
+                disabled=True,
+                key="dl_sql_main_disabled",
+                help="CREATE TABLE statements for Snowflake"
+            )
+    
+    with col4:
         report_exists = results.get('report_path') and results['report_path'].exists()
         if report_exists:
             with open(results['report_path'], 'rb') as f:
@@ -2439,21 +2513,27 @@ if st.session_state.results is not None:
     # Warnings, Errors, Info sections
     info_list, warnings_list, errors_list = aggregate_and_classify_messages(results)
     
-    # Render Info section
+    # Render Info section (NEW - shows successful fixes)
     if info_list:
         info_content = []
         for item in info_list:
             if isinstance(item, dict):
-                info_content.append(f"<div style='margin: 0.5rem 0;'>ℹ️ <strong>{item['summary']}</strong></div>")
-                if item.get('details') and len(item['details']) > 0:
+                summary = item.get('summary', '')
+                details = item.get('details', [])
+                info_content.append(f"<div style='margin: 0.5rem 0;'>ℹ️ <strong>{summary}</strong></div>")
+                if details and len(details) > 0:
                     detail_items = []
-                    for detail in item['details'][:10]:  # Limit to first 10
-                        detail_items.append(f"<div style='margin: 0.25rem 0; margin-left: 1.5rem;'>• {detail}</div>")
+                    for detail in details[:10]:  # Limit to first 10
+                        if isinstance(detail, tuple):
+                            detail_items.append(f"<div style='margin: 0.25rem 0; margin-left: 1.5rem;'>• <strong>{detail[0]}:</strong> {detail[1]}</div>")
+                        else:
+                            detail_items.append(f"<div style='margin: 0.25rem 0; margin-left: 1.5rem;'>• {detail}</div>")
                     details_html = "".join(detail_items)
                     info_content.append(f"<div style='margin-left: 1rem; margin-top: 0.5rem; margin-bottom: 0.5rem;'>{details_html}</div>")
             else:
                 info_content.append(f"<div style='margin: 0.5rem 0;'>ℹ️ {item}</div>")
-        custom_expander("Info", expanded=False, content_html="".join(info_content))
+        # Use custom expander for Info section
+        custom_expander("✅ Info", expanded=False, content_html="".join(info_content))
     
     # Render Warnings section
     if warnings_list:
@@ -2472,7 +2552,7 @@ if st.session_state.results is not None:
                     warnings_content.append(f"<div style='margin-left: 1rem; margin-top: 0.5rem; margin-bottom: 0.5rem;'>{details_html}</div>")
             else:
                 warnings_content.append(f"<div style='margin: 0.5rem 0;'>⚠️ {item}</div>")
-        custom_expander("Warnings", expanded=False, content_html="".join(warnings_content))
+        custom_expander("⚠️ Warnings", expanded=False, content_html="".join(warnings_content))
     
     # Render Errors section
     if errors_list:
@@ -2482,7 +2562,7 @@ if st.session_state.results is not None:
         if len(errors_list) > 10:
             more_errors_html = "".join([f"<div style='margin: 0.5rem 0;'>❌ {error}</div>" for error in errors_list[10:]])
             errors_content.append(f"<div style='margin-top: 1rem;'><strong>Additional errors:</strong></div>{more_errors_html}")
-        custom_expander("Errors", expanded=False, content_html="".join(errors_content))
+        custom_expander("❌ Errors", expanded=False, content_html="".join(errors_content))
 
 # Batch results section
 if st.session_state.batch_results is not None:
